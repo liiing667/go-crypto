@@ -194,7 +194,8 @@ type Config struct {
 	InsecureGenerateNonCriticalSignatureCreationTime bool
 
 	// MaxDecompressedMessageSize specifies the maximum number of bytes that can be
-	// read from a compressed packet. This serves as an upper limit to prevent
+	// read from a compressed packet. The limit is cumulative across all nested
+	// compression layers of a message. This serves as an upper limit to prevent
 	// excessively large decompressed messages.
 	MaxDecompressedMessageSize *int64
 }

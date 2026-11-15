@@ -256,6 +256,13 @@ func readSignedMessage(packets *packet.Reader, mdin *MessageDetails, keyring Key
 	var h hash.Hash
 	var wrappedHash hash.Hash
 	var prevLast bool
+	// The decompressed message size limit is a single budget shared by all
+	// compression layers of this message, so copy it once per message.
+	var decompressedSizeLimit *int64
+	if limit := config.DecompressedMessageSizeLimit(); limit != nil {
+		budget := *limit
+		decompressedSizeLimit = &budget
+	}
 FindLiteralData:
 	for {
 		p, err = packets.Next()
@@ -264,7 +271,7 @@ FindLiteralData:
 		}
 		switch p := p.(type) {
 		case *packet.Compressed:
-			if err := packets.Push(p.LimitedBodyReader(config.DecompressedMessageSizeLimit())); err != nil {
+			if err := packets.Push(p.LimitedBodyReader(decompressedSizeLimit)); err != nil {
 				return nil, err
 			}
 		case *packet.OnePassSignature:

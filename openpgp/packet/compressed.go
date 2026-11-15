@@ -71,6 +71,16 @@ func (dr *decompressionReader) Read(data []byte) (n int, err error) {
 	return n, err
 }
 
+// Close closes the underlying decompressor. It is idempotent and safe to
+// call even if the stream was already fully read.
+func (dr *decompressionReader) Close() error {
+	if dr.readAll {
+		return nil
+	}
+	dr.readAll = true
+	return dr.decompressed.Close()
+}
+
 func (c *Compressed) parse(r io.Reader) error {
 	var buf [1]byte
 	_, err := readFull(r, buf[:])
@@ -98,14 +108,60 @@ func (c *Compressed) parse(r io.Reader) error {
 	return err
 }
 
-// LimitedBodyReader wraps the provided body reader with a limiter that restricts
-// the number of bytes read to the specified limit.
+// LimitedBodyReader wraps the provided body reader with a limiter that
+// restricts the number of bytes read to the specified limit.
+// The limit is a shared budget: the pointed-to value is decremented as bytes
+// are read, so callers should pass a per-message copy such that all nested
+// compression layers of a single message cumulatively consume the same
+// budget. When the budget is exhausted, the body reader is closed if it
+// implements io.Closer.
 // If limit is nil, the reader is unbounded.
 func (c *Compressed) LimitedBodyReader(limit *int64) io.Reader {
 	if limit == nil {
 		return c.Body
 	}
-	return &LimitReader{R: c.Body, N: *limit}
+	return &sharedLimitReader{body: c.Body, remaining: limit}
+}
+
+// sharedLimitReader is an io.Reader that fails with errors.ErrMessageTooLarge
+// once the cumulative number of bytes read through all readers sharing the
+// same remaining budget exceeds it. On exhaustion, it closes the underlying
+// reader if it implements io.Closer, so that decompression resources are
+// released immediately.
+type sharedLimitReader struct {
+	body      io.Reader
+	remaining *int64
+	closed    bool
+}
+
+func (l *sharedLimitReader) Read(p []byte) (int, error) {
+	if *l.remaining <= 0 {
+		l.closeBody()
+		return 0, errors.ErrMessageTooLarge
+	}
+
+	n, err := l.body.Read(p)
+	*l.remaining -= int64(n)
+
+	if *l.remaining <= 0 {
+		l.closeBody()
+		return n, errors.ErrMessageTooLarge
+	}
+	if err != nil {
+		l.closeBody()
+	}
+
+	return n, err
+}
+
+func (l *sharedLimitReader) closeBody() {
+	if l.closed {
+		return
+	}
+	l.closed = true
+	if closer, ok := l.body.(io.Closer); ok {
+		closer.Close()
+	}
 }
 
 // compressedWriterCloser represents the serialized compression stream

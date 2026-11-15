@@ -6,6 +6,7 @@ package openpgp
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
@@ -950,5 +951,73 @@ func TestReadV5Messages(t *testing.T) {
 	}
 	if md.SignatureError != nil {
 		t.Error("expected no signature error, got:", md.SignatureError)
+	}
+}
+
+// buildNestedCompressedMessage builds a message consisting of `layers` nested
+// compressed packets wrapping a literal data packet with the given payload.
+func buildNestedCompressedMessage(t *testing.T, layers int, payload []byte) []byte {
+	t.Helper()
+	buf := bytes.NewBuffer(nil)
+	w := io.WriteCloser(noOpCloser{buf})
+	for i := 0; i < layers; i++ {
+		wc, err := packet.SerializeCompressed(w, packet.CompressionZLIB, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w = wc
+	}
+	lw, err := packet.SerializeLiteral(w, true, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lw.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	// Closing the literal writer cascades and closes the whole chain of
+	// compressed writers below it.
+	if err := lw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestReadMessageNestedCompressionLimit(t *testing.T) {
+	// Incompressible payload so that each layer decompresses to roughly
+	// the payload size.
+	payload := make([]byte, 800)
+	rand.Read(payload)
+	msg := buildNestedCompressedMessage(t, 3, payload)
+
+	// Each layer alone decompresses to less than 1024 bytes, but the
+	// cumulative decompressed size of all layers exceeds it, so the
+	// shared per-message budget must be exhausted.
+	max := int64(1024)
+	config := &packet.Config{
+		MaxDecompressedMessageSize: &max,
+	}
+	md, err := ReadMessage(bytes.NewReader(msg), nil, nil, config)
+	if err == nil {
+		_, err = io.ReadAll(md.UnverifiedBody)
+	}
+	if err != errors.ErrMessageTooLarge {
+		t.Errorf("expected ErrMessageTooLarge, got %v", err)
+	}
+
+	// A generous limit accommodates the legal multi-layer message.
+	max = int64(1 << 20)
+	config = &packet.Config{
+		MaxDecompressedMessageSize: &max,
+	}
+	md, err = ReadMessage(bytes.NewReader(msg), nil, nil, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := io.ReadAll(md.UnverifiedBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(contents, payload) {
+		t.Error("decompressed message contents do not match payload")
 	}
 }
