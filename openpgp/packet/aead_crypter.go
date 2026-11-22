@@ -55,20 +55,58 @@ func (wo *aeadCrypter) incrementIndex() error {
 	return errors.AEADError("cannot further increment index")
 }
 
-// aeadDecrypter reads and decrypts bytes. It buffers extra decrypted bytes when
-// necessary, similar to aeadEncrypter.
+// aeadDecrypter authenticates and decrypts a complete stream. It stages
+// plaintext internally and does not publish it until every chunk and the final
+// tag have been verified.
 type aeadDecrypter struct {
 	aeadCrypter           // Embedded ciphertext opener
 	reader      io.Reader // 'reader' is a partialLengthReader
 	chunkBytes  []byte
 	peekedBytes []byte    // Used to detect last chunk
 	buffer      []byte    // Buffered decrypted bytes
+	err         error     // Latched error of the whole message transaction
+	staged      bool      // Whether the whole stream has been decrypted and authenticated
+	closed      bool      // Whether Close has been called successfully
+	sawChunk    bool      // Whether at least one data chunk was authenticated
 }
 
-// Read decrypts bytes and reads them into dst. It decrypts when necessary and
-// buffers extra decrypted bytes. It returns the number of bytes copied into dst
-// and an error.
+// Read decrypts and authenticates the whole message before publishing any
+// plaintext to the caller. AEAD chunks are authenticated individually, but the
+// final tag authenticates the length of the complete stream. Returning earlier
+// chunks before the final tag has been checked would let a caller consume
+// plaintext from a message that is later found to be truncated or otherwise
+// incomplete. The staged plaintext is only published after every chunk tag and
+// the final tag have been verified.
 func (ar *aeadDecrypter) Read(dst []byte) (n int, err error) {
+	if ar.err != nil {
+		return 0, ar.err
+	}
+	if !ar.staged {
+		if err := ar.stage(); err != nil {
+			return 0, err
+		}
+	}
+	if ar.closed {
+		return 0, io.EOF
+	}
+
+	// Return buffered plaintext bytes from previous calls
+	if len(ar.buffer) > 0 {
+		n = copy(dst, ar.buffer)
+		if n == len(ar.buffer) {
+			ar.buffer = nil
+		} else {
+			ar.buffer = ar.buffer[n:]
+		}
+		return n, nil
+	}
+
+	return 0, io.EOF
+}
+
+// readSource decrypts the next chunk from the stream. It is only used while
+// staging the message transaction and never publishes data to the caller.
+func (ar *aeadDecrypter) readSource(dst []byte) (n int, err error) {
 	// Return buffered plaintext bytes from previous calls
 	if len(ar.buffer) > 0 {
 		n = copy(dst, ar.buffer)
@@ -85,6 +123,7 @@ func (ar *aeadDecrypter) Read(dst []byte) (n int, err error) {
 	}
 
 	if bytesRead > 0 {
+		ar.sawChunk = true
 		ar.peekedBytes = ar.chunkBytes[bytesRead:bytesRead+tagLen]
 
 		decrypted, errChunk := ar.openChunk(ar.chunkBytes[:bytesRead])
@@ -101,14 +140,70 @@ func (ar *aeadDecrypter) Read(dst []byte) (n int, err error) {
 	return 0, io.EOF
 }
 
-// Close checks the final authentication tag of the stream.
-// In the future, this function could also be used to wipe the reader
-// and peeked & decrypted bytes, if necessary.
-func (ar *aeadDecrypter) Close() (err error) {
-	errChunk := ar.validateFinalTag(ar.peekedBytes)
-	if errChunk != nil {
-		return errChunk
+// stage drains and authenticates the complete stream into memory. Plaintext is
+// only made available through ar.buffer if every chunk and the final tag are
+// valid.
+func (ar *aeadDecrypter) stage() error {
+	if ar.staged {
+		return ar.err
 	}
+	ar.staged = true
+
+	var plaintext []byte
+	var buf [32 * 1024]byte
+	emptyReads := 0
+	for {
+		n, err := ar.readSource(buf[:])
+		if n > 0 {
+			plaintext = append(plaintext, buf[:n]...)
+			emptyReads = 0
+		} else if err == nil {
+			emptyReads++
+			if emptyReads >= 100 {
+				return ar.fail(io.ErrNoProgress)
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return ar.fail(err)
+		}
+	}
+
+	if err := ar.validateFinalTag(ar.peekedBytes); err != nil {
+		return ar.fail(err)
+	}
+	if !ar.sawChunk {
+		// A complete stream always contains at least one data chunk (which
+		// may be empty) before the final authentication tag. A bare final
+		// tag must not be accepted as an empty message.
+		return ar.fail(errors.ErrAEADTagVerification)
+	}
+	ar.buffer = plaintext
+	return nil
+}
+
+func (ar *aeadDecrypter) fail(err error) error {
+	ar.buffer = nil
+	ar.err = err
+	return err
+}
+
+// Close authenticates the stream if it has not been consumed yet and reports
+// the same latched error as Read. A successful Close therefore means the whole
+// message transaction, including every chunk tag and the final tag, succeeded.
+func (ar *aeadDecrypter) Close() (err error) {
+	if ar.err != nil {
+		return ar.err
+	}
+	if !ar.staged {
+		if err := ar.stage(); err != nil {
+			return err
+		}
+	}
+	ar.closed = true
+	ar.buffer = nil
 	return nil
 }
 

@@ -490,18 +490,27 @@ func (cr *checkReader) Read(buf []byte) (int, error) {
 				break
 			}
 			if err != nil {
+				if errors.IsIntegrityError(err) {
+					return 0, err
+				}
 				return n, err
 			}
 		}
 		if cr.md.decrypted != nil {
 			if sensitiveParsingError := cr.md.decrypted.Close(); sensitiveParsingError != nil {
-				return n, errors.HandleSensitiveParsingError(sensitiveParsingError, true)
+				if errors.IsIntegrityError(sensitiveParsingError) {
+					return 0, sensitiveParsingError
+				}
+				return 0, errors.HandleSensitiveParsingError(sensitiveParsingError, true)
 			}
 		}
 		cr.checked = true
 		return n, io.EOF
 	}
 	if sensitiveParsingError != nil {
+		if errors.IsIntegrityError(sensitiveParsingError) {
+			return 0, sensitiveParsingError
+		}
 		return n, errors.HandleSensitiveParsingError(sensitiveParsingError, true)
 	}
 	return n, nil
@@ -538,6 +547,9 @@ func (scr *signatureCheckReader) Read(buf []byte) (int, error) {
 				break
 			}
 			if sensitiveParsingErrorPacket != nil {
+				if errors.IsIntegrityError(sensitiveParsingErrorPacket) {
+					return 0, sensitiveParsingErrorPacket
+				}
 				return n, errors.HandleSensitiveParsingError(sensitiveParsingErrorPacket, readsDecryptedData)
 			}
 			if sig, ok := p.(*packet.Signature); ok {
@@ -552,7 +564,10 @@ func (scr *signatureCheckReader) Read(buf []byte) (int, error) {
 		if scr.md.decrypted != nil {
 			sensitiveParsingErrorPacket := scr.md.decrypted.Close()
 			if sensitiveParsingErrorPacket != nil {
-				return n, errors.HandleSensitiveParsingError(sensitiveParsingErrorPacket, true)
+				if errors.IsIntegrityError(sensitiveParsingErrorPacket) {
+					return 0, sensitiveParsingErrorPacket
+				}
+				return 0, errors.HandleSensitiveParsingError(sensitiveParsingErrorPacket, true)
 			}
 		}
 
@@ -652,6 +667,9 @@ func (scr *signatureCheckReader) Read(buf []byte) (int, error) {
 	}
 
 	if sensitiveParsingError != nil {
+		if errors.IsIntegrityError(sensitiveParsingError) {
+			return 0, sensitiveParsingError
+		}
 		return n, errors.HandleSensitiveParsingError(sensitiveParsingError, readsDecryptedData)
 	}
 

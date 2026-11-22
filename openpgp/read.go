@@ -366,13 +366,19 @@ func (cr *checkReader) Read(buf []byte) (int, error) {
 		}
 		mdcErr := cr.md.decrypted.Close()
 		if mdcErr != nil {
-			return n, mdcErr
+			// The message transaction has not been authenticated. Close is
+			// the publication boundary, so discard any bytes returned by the
+			// underlying literal reader together with the error.
+			return 0, mdcErr
 		}
 		cr.checked = true
 		return n, io.EOF
 	}
 
 	if sensitiveParsingError != nil {
+		if errors.IsIntegrityError(sensitiveParsingError) {
+			return 0, sensitiveParsingError
+		}
 		return n, errors.HandleSensitiveParsingError(sensitiveParsingError, true)
 	}
 
@@ -401,31 +407,46 @@ func (scr *signatureCheckReader) Read(buf []byte) (int, error) {
 	if sensitiveParsingError == io.EOF {
 		var p packet.Packet
 		var readError error
-		var sig *packet.Signature
+		var signatures []*packet.Signature
 
 		p, readError = scr.packets.Next()
 		for readError == nil {
-			var ok bool
-			if sig, ok = p.(*packet.Signature); ok {
+			if sig, ok := p.(*packet.Signature); ok {
 				if sig.Version == 5 && (sig.SigType == 0x00 || sig.SigType == 0x01) {
 					sig.Metadata = scr.md.LiteralData
 				}
-
-				// If signature KeyID matches
-				if scr.md.SignedBy != nil && sig.IssuerKeyId != nil && *sig.IssuerKeyId == scr.md.SignedByKeyId {
-					key := scr.md.SignedBy
-					signatureError := key.PublicKey.VerifySignature(scr.h, sig)
-					if signatureError == nil {
-						signatureError = checkMessageSignatureDetails(key, sig, scr.config)
-					}
-					scr.md.Signature = sig
-					scr.md.SignatureError = signatureError
-				} else {
-					scr.md.UnverifiedSignatures = append(scr.md.UnverifiedSignatures, sig)
-				}
+				signatures = append(signatures, sig)
 			}
 
 			p, readError = scr.packets.Next()
+		}
+
+		// The SymmetricallyEncrypted packet, if any, might have an
+		// unsigned hash of its own. In order to check this we need to
+		// close that Reader before committing any signature result to
+		// MessageDetails.
+		if scr.md.decrypted != nil {
+			if sensitiveParsingError := scr.md.decrypted.Close(); sensitiveParsingError != nil {
+				if errors.IsIntegrityError(sensitiveParsingError) {
+					return 0, sensitiveParsingError
+				}
+				return 0, errors.HandleSensitiveParsingError(sensitiveParsingError, true)
+			}
+		}
+
+		for _, sig := range signatures {
+			// If signature KeyID matches
+			if scr.md.SignedBy != nil && sig.IssuerKeyId != nil && *sig.IssuerKeyId == scr.md.SignedByKeyId {
+				key := scr.md.SignedBy
+				signatureError := key.PublicKey.VerifySignature(scr.h, sig)
+				if signatureError == nil {
+					signatureError = checkMessageSignatureDetails(key, sig, scr.config)
+				}
+				scr.md.Signature = sig
+				scr.md.SignatureError = signatureError
+			} else {
+				scr.md.UnverifiedSignatures = append(scr.md.UnverifiedSignatures, sig)
+			}
 		}
 
 		if scr.md.SignedBy != nil && scr.md.Signature == nil {
@@ -435,19 +456,13 @@ func (scr *signatureCheckReader) Read(buf []byte) (int, error) {
 				scr.md.SignatureError = errors.StructuralError("No matching signature found")
 			}
 		}
-
-		// The SymmetricallyEncrypted packet, if any, might have an
-		// unsigned hash of its own. In order to check this we need to
-		// close that Reader.
-		if scr.md.decrypted != nil {
-			if sensitiveParsingError := scr.md.decrypted.Close(); sensitiveParsingError != nil {
-				return n, errors.HandleSensitiveParsingError(sensitiveParsingError, true)
-			}
-		}
 		return n, io.EOF
 	}
 
 	if sensitiveParsingError != nil {
+		if errors.IsIntegrityError(sensitiveParsingError) {
+			return 0, sensitiveParsingError
+		}
 		return n, errors.HandleSensitiveParsingError(sensitiveParsingError, readsDecryptedData)
 	}
 

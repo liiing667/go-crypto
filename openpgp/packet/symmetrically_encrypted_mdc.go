@@ -73,7 +73,8 @@ const mdcTrailerSize = 1 /* tag byte */ + 1 /* length byte */ + sha1.Size
 // An seMDCReader wraps an io.Reader, maintains a running hash and keeps hold
 // of the most recent 22 bytes (mdcTrailerSize). Upon EOF, those bytes form an
 // MDC packet containing a hash of the previous Contents which is checked
-// against the running hash. See RFC 4880, section 5.13.
+// against the running hash. Only after that check succeeds is the staged
+// plaintext published to the caller. See RFC 4880, section 5.13.
 type seMDCReader struct {
 	in          io.Reader
 	h           hash.Hash
@@ -82,9 +83,47 @@ type seMDCReader struct {
 	trailerUsed int
 	error       bool
 	eof         bool
+
+	staged    bool
+	plaintext []byte
+	offset    int
+	finalErr  error
+	closed    bool
 }
 
+// Read authenticates the complete message before publishing any plaintext.
+// The MDC covers the entire encrypted stream, so no byte can be trusted until
+// the final MDC packet has been seen and checked. On any short read,
+// truncation, or MDC mismatch no plaintext is returned and the same error is
+// reported by every subsequent Read and by Close.
 func (ser *seMDCReader) Read(buf []byte) (n int, err error) {
+	if ser.finalErr != nil {
+		return 0, ser.finalErr
+	}
+	if !ser.staged {
+		if err := ser.stage(); err != nil {
+			return 0, err
+		}
+	}
+	if ser.closed {
+		return 0, io.EOF
+	}
+	if ser.offset >= len(ser.plaintext) {
+		return 0, io.EOF
+	}
+
+	n = copy(buf, ser.plaintext[ser.offset:])
+	ser.offset += n
+	if ser.offset >= len(ser.plaintext) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// readPlaintext streams the plaintext preceding the MDC trailer. It is only
+// used while staging the message transaction and never returns data directly
+// to the caller.
+func (ser *seMDCReader) readPlaintext(buf []byte) (n int, err error) {
 	if ser.error {
 		err = io.ErrUnexpectedEOF
 		return
@@ -146,20 +185,33 @@ func (ser *seMDCReader) Read(buf []byte) (n int, err error) {
 // This is a new-format packet tag byte for a type 19 (Integrity Protected) packet.
 const mdcPacketTagByte = byte(0x80) | 0x40 | 19
 
-func (ser *seMDCReader) Close() error {
-	if ser.error {
-		return errors.ErrMDCHashMismatch
+// stage drains the complete stream and verifies the MDC before exposing any
+// plaintext to the caller.
+func (ser *seMDCReader) stage() error {
+	if ser.staged {
+		return ser.finalErr
 	}
+	ser.staged = true
 
-	for !ser.eof {
-		// We haven't seen EOF so we need to read to the end
-		var buf [1024]byte
-		_, err := ser.Read(buf[:])
+	var plaintext []byte
+	var buf [1024]byte
+	emptyReads := 0
+	for {
+		n, err := ser.readPlaintext(buf[:])
+		if n > 0 {
+			plaintext = append(plaintext, buf[:n]...)
+			emptyReads = 0
+		} else if err == nil {
+			emptyReads++
+			if emptyReads >= 100 {
+				return ser.fail()
+			}
+		}
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return errors.ErrMDCHashMismatch
+			return ser.fail()
 		}
 	}
 
@@ -167,13 +219,39 @@ func (ser *seMDCReader) Close() error {
 
 	final := ser.h.Sum(nil)
 	if subtle.ConstantTimeCompare(final, ser.trailer[2:]) != 1 {
-		return errors.ErrMDCHashMismatch
+		return ser.fail()
 	}
 	// The hash already includes the MDC header, but we still check its value
 	// to confirm encryption correctness
 	if ser.trailer[0] != mdcPacketTagByte || ser.trailer[1] != sha1.Size {
-		return errors.ErrMDCHashMismatch
+		return ser.fail()
 	}
+	ser.plaintext = plaintext
+	return nil
+}
+
+func (ser *seMDCReader) fail() error {
+	ser.error = true
+	ser.finalErr = errors.ErrMDCHashMismatch
+	ser.plaintext = nil
+	return ser.finalErr
+}
+
+// Close drains and authenticates the stream if the caller did not consume it,
+// and returns the same latched result as Read. A successful Close therefore
+// guarantees that the complete message transaction succeeded.
+func (ser *seMDCReader) Close() error {
+	if ser.finalErr != nil {
+		return ser.finalErr
+	}
+	if !ser.staged {
+		if err := ser.stage(); err != nil {
+			return err
+		}
+	}
+	ser.closed = true
+	ser.plaintext = nil
+	ser.offset = 0
 	return nil
 }
 

@@ -58,6 +58,16 @@ func HandleSensitiveParsingError(err error, decrypted bool) error {
 	return ErrDecryptSessionKeyParsing
 }
 
+// IsIntegrityError reports whether err is one of the uniform integrity
+// failures produced by authenticated decryption.
+func IsIntegrityError(err error) bool {
+	switch err {
+	case ErrMDCHashMismatch, ErrMDCMissing, ErrAEADTagVerification:
+		return true
+	}
+	return false
+}
+
 // UnsupportedError indicates that, although the OpenPGP data is valid, it
 // makes use of currently unimplemented features.
 type UnsupportedError string

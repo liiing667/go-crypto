@@ -68,10 +68,14 @@ func TestMDCReader(t *testing.T) {
 
 	r := &testReader{data: mdcPlaintext, stride: 2}
 	mdcReader := &seMDCReader{in: r, h: sha1.New()}
-	_, err := io.ReadAll(mdcReader)
-	if err != nil {
-		t.Errorf("corruption test, error: %s", err)
-		return
+	body, err := io.ReadAll(mdcReader)
+	if err == nil {
+		t.Error("corruption: read succeeded")
+	} else if !goerrors.Is(err, errors.ErrMDCHashMismatch) {
+		t.Errorf("corruption: expected SignatureError, got: %s", err)
+	}
+	if len(body) != 0 {
+		t.Errorf("corruption: published %d unauthenticated plaintext bytes", len(body))
 	}
 	err = mdcReader.Close()
 	if err == nil {
@@ -79,6 +83,67 @@ func TestMDCReader(t *testing.T) {
 	} else if !goerrors.Is(err, errors.ErrMDCHashMismatch) {
 		t.Errorf("corruption: expected SignatureError, got: %s", err)
 	}
+}
+
+func TestMDCReaderTransaction(t *testing.T) {
+	valid, _ := hex.DecodeString(mdcPlaintextHex)
+
+	t.Run("valid close without read", func(t *testing.T) {
+		mdcReader := &seMDCReader{
+			in: &testReader{data: append([]byte(nil), valid...), stride: 3},
+			h:  sha1.New(),
+		}
+		if err := mdcReader.Close(); err != nil {
+			t.Fatalf("Close on a valid unread stream failed: %v", err)
+		}
+		if _, err := mdcReader.Read(make([]byte, 16)); err != io.EOF {
+			t.Fatalf("Read after Close = %v, want io.EOF", err)
+		}
+	})
+
+	t.Run("truncated", func(t *testing.T) {
+		for _, cut := range []int{1, mdcTrailerSize - 1, mdcTrailerSize, mdcTrailerSize + 1} {
+			if cut >= len(valid) {
+				continue
+			}
+			mdcReader := &seMDCReader{
+				in: &testReader{data: append([]byte(nil), valid[:len(valid)-cut]...), stride: 2},
+				h:  sha1.New(),
+			}
+			body, err := io.ReadAll(mdcReader)
+			if err == nil {
+				t.Fatalf("cut=%d: read of truncated stream succeeded", cut)
+			}
+			if len(body) != 0 {
+				t.Fatalf("cut=%d: published %d unauthenticated plaintext bytes", cut, len(body))
+			}
+			if closeErr := mdcReader.Close(); closeErr != err {
+				t.Fatalf("cut=%d: Read error %v, Close error %v", cut, err, closeErr)
+			}
+			if _, retryErr := mdcReader.Read(make([]byte, 16)); retryErr != err {
+				t.Fatalf("cut=%d: retry error %v, want %v", cut, retryErr, err)
+			}
+		}
+	})
+
+	t.Run("corrupt trailer", func(t *testing.T) {
+		corrupt := append([]byte(nil), valid...)
+		corrupt[len(corrupt)-1] ^= 0xff
+		mdcReader := &seMDCReader{
+			in: &testReader{data: corrupt, stride: 2},
+			h:  sha1.New(),
+		}
+		body, err := io.ReadAll(mdcReader)
+		if err == nil {
+			t.Fatal("read of corrupt stream succeeded")
+		}
+		if len(body) != 0 {
+			t.Fatalf("published %d unauthenticated plaintext bytes", len(body))
+		}
+		if closeErr := mdcReader.Close(); closeErr != err {
+			t.Fatalf("Read error %v, Close error %v", err, closeErr)
+		}
+	})
 }
 
 func TestSerializeMdc(t *testing.T) {
