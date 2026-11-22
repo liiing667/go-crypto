@@ -291,6 +291,12 @@ type SignatureCandidate struct {
 	SignatureError    error             // nil if the signature is valid or not checked.
 	CorrespondingSig  *packet.Signature // the candidate's signature packet
 	Hash, WrappedHash hash.Hash         // hashes for this signature candidate (OPS)
+
+	// packetDepth is the nesting depth of the packet source that contained the
+	// one-pass signature. Signatures may only be matched with candidates from
+	// the same source; a signature from another compression layer is unrelated
+	// to this body, even if it uses the same key.
+	packetDepth int
 }
 
 func newSignatureCandidate(ops *packet.OnePassSignature) (sigCandidate *SignatureCandidate) {
@@ -365,28 +371,33 @@ func readSignedMessage(packets packet.PacketReader, mdin *MessageDetails, keyrin
 	md = mdin
 
 	var p packet.Packet
-	var prevLast bool
+	// One-pass signature packets are scoped to the packet source that contains
+	// them. Compression introduces a new source, so its one-pass signatures
+	// form an independent sequence.
+	lastOnePassAtDepth := make(map[int]bool)
 FindLiteralData:
 	for {
 		p, err = packets.Next()
 		if err != nil {
 			return nil, err
 		}
+		depth := packetReaderDepth(packets)
 		switch p := p.(type) {
 		case *packet.Compressed:
 			if err := packets.Push(p.LimitedBodyReader(config.DecompressedMessageSizeLimit())); err != nil {
 				return nil, err
 			}
 		case *packet.OnePassSignature:
-			if prevLast {
+			if lastOnePassAtDepth[depth] {
 				return nil, errors.UnsupportedError("nested signature packets")
 			}
 
 			if p.IsLast {
-				prevLast = true
+				lastOnePassAtDepth[depth] = true
 			}
 
 			sigCandidate := newSignatureCandidate(p)
+			sigCandidate.packetDepth = depth
 			md.IsSigned = true
 			if keyring != nil {
 				keys := keyring.EntitiesById(p.KeyId)
@@ -402,6 +413,7 @@ FindLiteralData:
 			if err != nil {
 				return nil, err
 			}
+			sigCandidate.packetDepth = depth
 			md.IsSigned = true
 			if keyring != nil {
 				keys := keyring.EntitiesById(sigCandidate.IssuerKeyId)
@@ -422,12 +434,24 @@ FindLiteralData:
 	}
 
 	if md.IsSigned {
-		md.UnverifiedBody = &signatureCheckReader{packets, md, config, md.LiteralData.Body}
+		md.UnverifiedBody = &signatureCheckReader{
+			packets: packets,
+			md:      md,
+			config:  config,
+			data:    md.LiteralData.Body,
+		}
 	} else {
 		md.UnverifiedBody = &checkReader{md, packets, false}
 	}
 
 	return md, nil
+}
+
+func packetReaderDepth(packets packet.PacketReader) int {
+	if reader, ok := packets.(interface{ Depth() int }); ok {
+		return reader.Depth()
+	}
+	return 0
 }
 
 func wrapHashForSignature(hashFunc hash.Hash, sigType packet.SignatureType) (hash.Hash, error) {
@@ -515,140 +539,38 @@ type signatureCheckReader struct {
 	md      *MessageDetails
 	config  *packet.Config
 	data    io.Reader
+
+	checked     bool
+	terminalErr error
+
+	// structuralError records an incomplete or ambiguous packet transaction.
+	// Even if one layer contains a valid signature, the transaction as a whole
+	// is not committed while another declared one-pass signature is missing
+	// its final signature packet.
+	structuralError error
 }
 
 func (scr *signatureCheckReader) Read(buf []byte) (int, error) {
+	if scr.checked {
+		return 0, scr.terminalErr
+	}
+
 	n, sensitiveParsingError := scr.data.Read(buf)
 
 	for _, candidate := range scr.md.SignatureCandidates {
-		if candidate.SignatureError == nil && candidate.SignedByEntity != nil {
+		if candidate.SignatureError == nil && candidate.WrappedHash != nil {
 			candidate.WrappedHash.Write(buf[:n])
 		}
 	}
 
 	readsDecryptedData := scr.md.decrypted != nil
 	if sensitiveParsingError == io.EOF {
-
-		var signatures []*packet.Signature
-
-		// Read all signature packets and discard others.
-		for {
-			p, sensitiveParsingErrorPacket := scr.packets.Next()
-			if sensitiveParsingErrorPacket == io.EOF {
-				break
-			}
-			if sensitiveParsingErrorPacket != nil {
-				return n, errors.HandleSensitiveParsingError(sensitiveParsingErrorPacket, readsDecryptedData)
-			}
-			if sig, ok := p.(*packet.Signature); ok {
-				if sig.Version == 5 && scr.md.LiteralData != nil && (sig.SigType == 0x00 || sig.SigType == 0x01) {
-					sig.Metadata = scr.md.LiteralData
-				}
-				signatures = append(signatures, sig)
-			}
+		scr.terminalErr = scr.finish(readsDecryptedData)
+		if scr.terminalErr == nil {
+			scr.terminalErr = io.EOF
 		}
-
-		// Verify the integrity of the decrypted data before verifying the signatures.
-		if scr.md.decrypted != nil {
-			sensitiveParsingErrorPacket := scr.md.decrypted.Close()
-			if sensitiveParsingErrorPacket != nil {
-				return n, errors.HandleSensitiveParsingError(sensitiveParsingErrorPacket, true)
-			}
-		}
-
-		numberOfOpsSignatures := 0
-		for _, candidate := range scr.md.SignatureCandidates {
-			if candidate.CorrespondingSig == nil {
-				numberOfOpsSignatures++
-			}
-		}
-
-		if len(signatures) != numberOfOpsSignatures {
-			// Cannot handle this case yet with no information about invalid packets, should fail.
-			// This case can happen if a known OPS version is used but an unknown signature version.
-			noMatchError := errors.StructuralError("number of ops signature candidates does not match the number of signature packets")
-			for _, candidate := range scr.md.SignatureCandidates {
-				candidate.SignatureError = noMatchError
-			}
-		} else {
-			var sigIndex int
-			// Verify all signature candidates.
-			for _, candidate := range scr.md.SignatureCandidates {
-				if candidate.CorrespondingSig == nil {
-					candidate.CorrespondingSig = signatures[sigIndex]
-					sigIndex++
-				}
-				if !candidate.validate() {
-					candidate.SignatureError = errors.StructuralError("signature does not match the expected ops data")
-				}
-				if candidate.SignatureError == nil {
-					sig := candidate.CorrespondingSig
-					if candidate.SignedByEntity == nil {
-						candidate.SignatureError = errors.ErrUnknownIssuer
-						scr.md.SignatureError = candidate.SignatureError
-					} else {
-						// Verify and retrieve signing key at signature creation time
-						key, err := candidate.SignedByEntity.signingKeyByIdUsage(sig.CreationTime, candidate.IssuerKeyId, packet.KeyFlagSign, scr.config)
-						if err != nil {
-							candidate.SignatureError = err
-							continue
-						} else {
-							candidate.SignedBy = &key
-						}
-						signatureError := key.PublicKey.VerifySignature(candidate.Hash, sig)
-						if signatureError == nil {
-							signatureError = checkMessageSignatureDetails(&key, sig, scr.config)
-						}
-						if !scr.md.IsSymmetricallyEncrypted && len(sig.IntendedRecipients) > 0 && scr.md.CheckRecipients && signatureError == nil {
-							if !scr.md.IsEncrypted {
-								signatureError = errors.SignatureError("intended recipients in non-encrypted message")
-							} else {
-								// Check signature matches one of the recipients
-								signatureError = checkIntendedRecipientsMatch(&scr.md.DecryptedWith, sig)
-							}
-						}
-						candidate.SignatureError = signatureError
-					}
-				}
-			}
-		}
-
-		// Check if there is a valid candidate.
-		for _, candidate := range scr.md.SignatureCandidates {
-			if candidate.SignedBy == nil {
-				// Ignore candidates that have no matching key
-				continue
-			}
-			// md.SignatureError points to the last candidate with a key match, if
-			// all signature verifications have failed.
-			scr.md.SignatureError = candidate.SignatureError
-			scr.md.SelectedCandidate = candidate
-			if candidate.SignatureError == nil {
-				// There is a valid signature.
-				scr.md.Signature = candidate.CorrespondingSig
-				scr.md.SignedBy = candidate.SignedBy
-				break
-			}
-		}
-
-		if len(scr.md.SignatureCandidates) == 0 {
-			scr.md.SignatureError = errors.StructuralError("no signature found")
-		}
-
-		if len(scr.md.SignatureCandidates) > 0 && scr.md.SelectedCandidate == nil {
-			// No candidate with a matching key present.
-			// Just point to the last candidate in this case.
-			candidate := scr.md.SignatureCandidates[len(scr.md.SignatureCandidates)-1]
-			scr.md.SignatureError = candidate.SignatureError
-			scr.md.SelectedCandidate = candidate
-		}
-
-		if scr.md.SignatureError == nil && scr.md.Signature == nil {
-			scr.md.SignatureError = errors.StructuralError("no matching signature found")
-		}
-
-		scr.md.IsVerified = true
-		return n, io.EOF
+		scr.checked = true
+		return n, scr.terminalErr
 	}
 
 	if sensitiveParsingError != nil {
@@ -656,6 +578,202 @@ func (scr *signatureCheckReader) Read(buf []byte) (int, error) {
 	}
 
 	return n, nil
+}
+
+type signaturePacketWithDepth struct {
+	signature *packet.Signature
+	depth     int
+}
+
+func (scr *signatureCheckReader) finish(readsDecryptedData bool) error {
+	var signatures []signaturePacketWithDepth
+
+	// Read all trailing packets in this decoding transaction. Only signature
+	// packets are relevant after the literal data.
+	for {
+		p, err := scr.packets.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return errors.HandleSensitiveParsingError(err, readsDecryptedData)
+		}
+		if sig, ok := p.(*packet.Signature); ok {
+			if sig.Version == 5 && scr.md.LiteralData != nil && (sig.SigType == 0x00 || sig.SigType == 0x01) {
+				sig.Metadata = scr.md.LiteralData
+			}
+			signatures = append(signatures, signaturePacketWithDepth{
+				signature: sig,
+				depth:     packetReaderDepth(scr.packets),
+			})
+		}
+	}
+
+	// Verify the integrity of the decrypted data before verifying the signatures.
+	if scr.md.decrypted != nil {
+		if err := scr.md.decrypted.Close(); err != nil {
+			return errors.HandleSensitiveParsingError(err, true)
+		}
+	}
+
+	scr.pairSignatures(signatures)
+	scr.verifySignatures()
+	return nil
+}
+
+func (scr *signatureCheckReader) pairSignatures(signatures []signaturePacketWithDepth) {
+	opsByDepth := make(map[int][]*SignatureCandidate)
+	for _, candidate := range scr.md.SignatureCandidates {
+		if candidate.CorrespondingSig == nil {
+			opsByDepth[candidate.packetDepth] = append(opsByDepth[candidate.packetDepth], candidate)
+		}
+	}
+
+	signaturesByDepth := make(map[int][]*packet.Signature)
+	for _, signature := range signatures {
+		signaturesByDepth[signature.depth] = append(signaturesByDepth[signature.depth], signature.signature)
+	}
+
+	for depth, corresponding := range signaturesByDepth {
+		candidates := opsByDepth[depth]
+		if len(corresponding) != len(candidates) {
+			// Never let a signature from another layer satisfy one of these
+			// candidates. The incomplete layer also prevents the transaction
+			// from selecting an overall signer below.
+			noMatchError := errors.StructuralError("number of ops signature candidates does not match the number of signature packets")
+			scr.structuralError = noMatchError
+			for _, candidate := range candidates {
+				candidate.SignatureError = noMatchError
+			}
+			continue
+		}
+		for i, candidate := range candidates {
+			candidate.CorrespondingSig = corresponding[i]
+		}
+	}
+	for depth, candidates := range opsByDepth {
+		if _, ok := signaturesByDepth[depth]; ok {
+			continue
+		}
+		noMatchError := errors.StructuralError("number of ops signature candidates does not match the number of signature packets")
+		scr.structuralError = noMatchError
+		for _, candidate := range candidates {
+			candidate.SignatureError = noMatchError
+		}
+	}
+}
+
+func (scr *signatureCheckReader) verifySignatures() {
+	if scr.structuralError != nil {
+		// The message did not contain a complete set of final signature
+		// packets. Do not expose a signer from a different layer as if it
+		// completed this transaction.
+		scr.md.Signature = nil
+		scr.md.SignedBy = nil
+		scr.md.SignatureError = scr.structuralError
+		if len(scr.md.SignatureCandidates) > 0 {
+			var missingCandidate *SignatureCandidate
+			for _, candidate := range scr.md.SignatureCandidates {
+				if missingCandidate == nil && candidate.CorrespondingSig == nil {
+					missingCandidate = candidate
+				}
+				if candidate.SignatureError == nil {
+					candidate.SignatureError = scr.structuralError
+				}
+			}
+			scr.md.SelectedCandidate = missingCandidate
+			if scr.md.SelectedCandidate == nil {
+				scr.md.SelectedCandidate = scr.md.SignatureCandidates[len(scr.md.SignatureCandidates)-1]
+			}
+		}
+		scr.md.IsVerified = true
+		return
+	}
+
+	for _, candidate := range scr.md.SignatureCandidates {
+		if candidate.CorrespondingSig == nil {
+			if candidate.SignatureError == nil {
+				candidate.SignatureError = errors.StructuralError("one-pass signature has no corresponding signature packet")
+			}
+			continue
+		}
+		if candidate.SignatureError != nil {
+			continue
+		}
+		if candidate.CorrespondingSig.Version == 5 && scr.md.LiteralData != nil &&
+			(candidate.CorrespondingSig.SigType == 0x00 || candidate.CorrespondingSig.SigType == 0x01) {
+			candidate.CorrespondingSig.Metadata = scr.md.LiteralData
+		}
+		if !candidate.validate() {
+			candidate.SignatureError = errors.StructuralError("signature does not match the expected ops data")
+		}
+		if candidate.SignatureError != nil {
+			continue
+		}
+
+		sig := candidate.CorrespondingSig
+		if candidate.SignedByEntity == nil {
+			candidate.SignatureError = errors.ErrUnknownIssuer
+			continue
+		}
+
+		// Verify and retrieve signing key at signature creation time
+		key, err := candidate.SignedByEntity.signingKeyByIdUsage(sig.CreationTime, candidate.IssuerKeyId, packet.KeyFlagSign, scr.config)
+		if err != nil {
+			candidate.SignatureError = err
+			continue
+		}
+		candidate.SignedBy = &key
+		signatureError := key.PublicKey.VerifySignature(candidate.Hash, sig)
+		if signatureError == nil {
+			signatureError = checkMessageSignatureDetails(&key, sig, scr.config)
+		}
+		if !scr.md.IsSymmetricallyEncrypted && len(sig.IntendedRecipients) > 0 && scr.md.CheckRecipients && signatureError == nil {
+			if !scr.md.IsEncrypted {
+				signatureError = errors.SignatureError("intended recipients in non-encrypted message")
+			} else {
+				// Check signature matches one of the recipients
+				signatureError = checkIntendedRecipientsMatch(&scr.md.DecryptedWith, sig)
+			}
+		}
+		candidate.SignatureError = signatureError
+	}
+
+	// Check if there is a valid candidate.
+	for _, candidate := range scr.md.SignatureCandidates {
+		if candidate.SignedBy == nil {
+			// Ignore candidates that have no matching key
+			continue
+		}
+		// md.SignatureError points to the last candidate with a key match, if
+		// all signature verifications have failed.
+		scr.md.SignatureError = candidate.SignatureError
+		scr.md.SelectedCandidate = candidate
+		if candidate.SignatureError == nil {
+			// There is a valid signature.
+			scr.md.Signature = candidate.CorrespondingSig
+			scr.md.SignedBy = candidate.SignedBy
+			break
+		}
+	}
+
+	if len(scr.md.SignatureCandidates) == 0 {
+		scr.md.SignatureError = errors.StructuralError("no signature found")
+	}
+
+	if len(scr.md.SignatureCandidates) > 0 && scr.md.SelectedCandidate == nil {
+		// No candidate with a matching key present.
+		// Just point to the last candidate in this case.
+		candidate := scr.md.SignatureCandidates[len(scr.md.SignatureCandidates)-1]
+		scr.md.SignatureError = candidate.SignatureError
+		scr.md.SelectedCandidate = candidate
+	}
+
+	if scr.md.SignatureError == nil && scr.md.Signature == nil {
+		scr.md.SignatureError = errors.StructuralError("no matching signature found")
+	}
+
+	scr.md.IsVerified = true
 }
 
 // VerifyDetachedSignature takes a signed file and a detached signature and
@@ -737,7 +855,12 @@ func verifyDetachedSignatureReader(keyring KeyRing, signed, signature io.Reader,
 	if len(md.SignatureCandidates) == 0 {
 		return nil, errors.ErrUnknownIssuer
 	}
-	md.UnverifiedBody = &signatureCheckReader{packets, md, config, signed}
+	md.UnverifiedBody = &signatureCheckReader{
+		packets: packets,
+		md:      md,
+		config:  config,
+		data:    signed,
+	}
 	return md, nil
 }
 

@@ -128,6 +128,16 @@ func (r *Reader) Unread(p Packet) {
 	r.q = append(r.q, p)
 }
 
+// Depth returns the number of packet sources that are currently nested below
+// the top-level source. A compressed packet pushes a new source, so packets
+// inside it have a larger depth than the packets surrounding it.
+func (r *Reader) Depth() int {
+	if len(r.readers) == 0 {
+		return 0
+	}
+	return len(r.readers) - 1
+}
+
 func NewReader(r io.Reader) *Reader {
 	return &Reader{
 		q:       nil,
