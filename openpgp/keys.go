@@ -5,8 +5,12 @@
 package openpgp
 
 import (
+	"bytes"
+	"crypto"
+	"encoding"
 	goerrors "errors"
 	"fmt"
+	"hash"
 	"io"
 	"time"
 
@@ -156,14 +160,14 @@ func (e *Entity) EncryptionKey(now time.Time) (Key, bool) {
 
 	if candidateSubkey != -1 {
 		subkey := e.Subkeys[candidateSubkey]
-		return Key{e, subkey.PublicKey, subkey.PrivateKey, subkey.Sig, subkey.Revocations}, true
+		return Key{e, subkey.PublicKey, subkey.PrivateKey, subkey.Sig, cloneSignatureSlice(subkey.Revocations)}, true
 	}
 
 	// If we don't have any subkeys for encryption and the primary key
 	// is marked as OK to encrypt with, then we can use it.
 	if primarySelfSignature.FlagsValid && primarySelfSignature.FlagEncryptCommunications &&
 		e.PrimaryKey.PubKeyAlgo.CanEncrypt() {
-		return Key{e, e.PrimaryKey, e.PrivateKey, primarySelfSignature, e.Revocations}, true
+		return Key{e, e.PrimaryKey, e.PrivateKey, primarySelfSignature, cloneSignatureSlice(e.Revocations)}, true
 	}
 
 	return Key{}, false
@@ -226,7 +230,7 @@ func (e *Entity) signingKeyByIdUsage(now time.Time, id uint64, flags int) (Key, 
 
 	if candidateSubkey != -1 {
 		subkey := e.Subkeys[candidateSubkey]
-		return Key{e, subkey.PublicKey, subkey.PrivateKey, subkey.Sig, subkey.Revocations}, true
+		return Key{e, subkey.PublicKey, subkey.PrivateKey, subkey.Sig, cloneSignatureSlice(subkey.Revocations)}, true
 	}
 
 	// If we don't have any subkeys for signing and the primary key
@@ -236,7 +240,7 @@ func (e *Entity) signingKeyByIdUsage(now time.Time, id uint64, flags int) (Key, 
 		(flags&packet.KeyFlagSign == 0 || primarySelfSignature.FlagSign) &&
 		e.PrimaryKey.PubKeyAlgo.CanSign() &&
 		(id == 0 || e.PrimaryKey.KeyId == id) {
-		return Key{e, e.PrimaryKey, e.PrivateKey, primarySelfSignature, e.Revocations}, true
+		return Key{e, e.PrimaryKey, e.PrivateKey, primarySelfSignature, cloneSignatureSlice(e.Revocations)}, true
 	}
 
 	// No keys with a valid Signing Flag or no keys matched the id passed in
@@ -335,12 +339,12 @@ func (el EntityList) KeysById(id uint64) (keys []Key) {
 	for _, e := range el {
 		if e.PrimaryKey.KeyId == id {
 			selfSig, _ := e.PrimarySelfSignature()
-			keys = append(keys, Key{e, e.PrimaryKey, e.PrivateKey, selfSig, e.Revocations})
+			keys = append(keys, Key{e, e.PrimaryKey, e.PrivateKey, selfSig, cloneSignatureSlice(e.Revocations)})
 		}
 
 		for _, subKey := range e.Subkeys {
 			if subKey.PublicKey.KeyId == id {
-				keys = append(keys, Key{e, subKey.PublicKey, subKey.PrivateKey, subKey.Sig, subKey.Revocations})
+				keys = append(keys, Key{e, subKey.PublicKey, subKey.PrivateKey, subKey.Sig, cloneSignatureSlice(subKey.Revocations)})
 			}
 		}
 	}
@@ -385,7 +389,7 @@ func (el EntityList) DecryptionKeys() (keys []Key) {
 	for _, e := range el {
 		for _, subKey := range e.Subkeys {
 			if subKey.PrivateKey != nil && subKey.Sig.FlagsValid && (subKey.Sig.FlagEncryptStorage || subKey.Sig.FlagEncryptCommunications) {
-				keys = append(keys, Key{e, subKey.PublicKey, subKey.PrivateKey, subKey.Sig, subKey.Revocations})
+				keys = append(keys, Key{e, subKey.PublicKey, subKey.PrivateKey, subKey.Sig, cloneSignatureSlice(subKey.Revocations)})
 			}
 		}
 	}
@@ -911,4 +915,303 @@ func (e *Entity) PrimarySelfSignature() (*packet.Signature, *Identity) {
 		return nil, nil
 	}
 	return primaryIdentity.SelfSignature, primaryIdentity
+}
+
+// keySelection is the state of a single signing-key selection transaction.
+//
+// A verification operation must not combine the key that was selected for a
+// signature with the usage flags, validity time or revocation status of a
+// different key or entity. The Key is captured as a value (including a copy of
+// its revocation slice) and the time is captured once for the verification
+// transaction. Before the selection is committed, refreshFromEntity may be
+// used to pick up revocation state that belongs to the very same entity and
+// public key, but it never follows an entity pointer to a different key.
+type keySelection struct {
+	key                        Key
+	now                        time.Time
+	primaryKey                 *packet.PublicKey
+	primarySelfSignature       *packet.Signature
+	entityRevocations          []*packet.Signature
+	hasPrimaryIdentity         bool
+	primaryIdentityName        string
+	primaryIdentityRevocations []*packet.Signature
+	signedBySubKey             bool
+	requiredUsage              byte
+}
+
+func newKeySelection(key Key, now time.Time) *keySelection {
+	selection := &keySelection{
+		key: Key{
+			Entity:        key.Entity,
+			PublicKey:     key.PublicKey,
+			PrivateKey:    key.PrivateKey,
+			SelfSignature: key.SelfSignature,
+			Revocations:   cloneSignatureSlice(key.Revocations),
+		},
+		now: now,
+	}
+	if key.Entity != nil && key.Entity.PrimaryKey != nil {
+		selection.primaryKey = key.Entity.PrimaryKey
+		selection.primarySelfSignature, primaryIdentity := key.Entity.PrimarySelfSignature()
+		selection.entityRevocations = cloneSignatureSlice(key.Entity.Revocations)
+		selection.signedBySubKey = key.PublicKey != key.Entity.PrimaryKey
+		if primaryIdentity != nil {
+			selection.hasPrimaryIdentity = true
+			selection.primaryIdentityName = primaryIdentity.Name
+			selection.primaryIdentityRevocations = cloneSignatureSlice(primaryIdentity.Revocations)
+		}
+	}
+	return selection
+}
+
+func cloneSignatureSlice(signatures []*packet.Signature) []*packet.Signature {
+	if signatures == nil {
+		return nil
+	}
+	cloned := make([]*packet.Signature, len(signatures))
+	copy(cloned, signatures)
+	return cloned
+}
+
+// refreshFromEntity updates only the revocation state of the selected entity
+// and key. The public key pointer is used as the identity of the selection: if
+// the entity no longer contains that exact key, the captured state is left
+// untouched instead of borrowing another key's status. Usage flags and
+// self-signatures stay frozen at the selection transaction.
+func (selection *keySelection) refreshFromEntity() {
+	if selection == nil || selection.key.Entity == nil || selection.key.PublicKey == nil {
+		return
+	}
+	entity := selection.key.Entity
+	// If the entity has been replaced by another primary key, this is no
+	// longer the identity captured by the selection. Keep the snapshot
+	// instead of borrowing the replacement's revocation status.
+	if selection.primaryKey == nil || entity.PrimaryKey != selection.primaryKey {
+		return
+	}
+
+	// Refresh only revocation state. The key's self-signature, usage flags and
+	// selected time remain the ones from the selection transaction, so a
+	// rebind cannot change the key's role halfway through verification.
+	selection.entityRevocations = cloneSignatureSlice(entity.Revocations)
+	if selection.hasPrimaryIdentity {
+		if identity, ok := entity.Identities[selection.primaryIdentityName]; ok {
+			selection.primaryIdentityRevocations = cloneSignatureSlice(identity.Revocations)
+		}
+	}
+
+	if selection.signedBySubKey {
+		for index := range entity.Subkeys {
+			subkey := &entity.Subkeys[index]
+			if subkey.PublicKey == selection.key.PublicKey {
+				selection.key.Revocations = cloneSignatureSlice(subkey.Revocations)
+				return
+			}
+		}
+		return
+	}
+	selection.key.Revocations = cloneSignatureSlice(entity.Revocations)
+}
+
+func keyMatchesUsage(selfSignature *packet.Signature, requiredUsage byte) bool {
+	if requiredUsage == 0 {
+		return true
+	}
+	if selfSignature == nil || !selfSignature.FlagsValid {
+		return false
+	}
+	var usage byte
+	if selfSignature.FlagCertify {
+		usage |= packet.KeyFlagCertify
+	}
+	if selfSignature.FlagSign {
+		usage |= packet.KeyFlagSign
+	}
+	if selfSignature.FlagEncryptCommunications {
+		usage |= packet.KeyFlagEncryptCommunications
+	}
+	if selfSignature.FlagEncryptStorage {
+		usage |= packet.KeyFlagEncryptStorage
+	}
+	return usage&requiredUsage == requiredUsage
+}
+
+func filterKeysByFingerprint(keys []Key, fingerprint []byte) []Key {
+	if len(fingerprint) == 0 {
+		return keys
+	}
+	filtered := make([]Key, 0, len(keys))
+	for _, key := range keys {
+		if key.PublicKey != nil && bytes.Equal(key.PublicKey.Fingerprint, fingerprint) {
+			filtered = append(filtered, key)
+		}
+	}
+	return filtered
+}
+
+// signingKeysByIdUsage resolves, filters and copies all candidate signing keys
+// for an issuer in one step. The returned keys are independent values: later
+// mutations of the KeyRing slice or its revocation slices cannot alter them.
+// When the signature carries an issuer fingerprint, only the key with that
+// exact fingerprint may be selected. Falling back to a key id collision would
+// attribute the signature to another entity.
+func signingKeysByIdUsage(keyring KeyRing, id uint64, fingerprint []byte, requiredUsage byte) []Key {
+	if keyring == nil {
+		return nil
+	}
+	keys := keyring.KeysByIdUsage(id, requiredUsage)
+	candidates := make([]Key, 0, len(keys))
+	for _, key := range keys {
+		if key.PublicKey == nil {
+			continue
+		}
+		// KeysByIdUsage has already applied the required usage. Re-check it
+		// when a self-signature is available, but keep supporting custom
+		// KeyRing implementations that deliberately return a key without
+		// one.
+		if key.SelfSignature != nil && !keyMatchesUsage(key.SelfSignature, requiredUsage) {
+			continue
+		}
+		candidates = append(candidates, Key{
+			Entity:        key.Entity,
+			PublicKey:     key.PublicKey,
+			PrivateKey:    key.PrivateKey,
+			SelfSignature: key.SelfSignature,
+			Revocations:   cloneSignatureSlice(key.Revocations),
+		})
+	}
+	return filterKeysByFingerprint(candidates, fingerprint)
+}
+
+// snapshotKeyRing freezes the entity list of the built-in keyring
+// implementation. Custom KeyRing implementations are deliberately passed
+// through: the library cannot copy an arbitrary implementation without
+// knowing its identity model, and each lookup it performs is still bound to
+// the candidate keys and entity pointers returned at selection time.
+func snapshotKeyRing(keyring KeyRing) KeyRing {
+	if keyring == nil {
+		return nil
+	}
+	if entities, ok := keyring.(EntityList); ok {
+		snapshot := make(EntityList, len(entities))
+		copy(snapshot, entities)
+		return snapshot
+	}
+	if entities, ok := keyring.(*EntityList); ok && entities != nil {
+		snapshot := make(EntityList, len(*entities))
+		copy(snapshot, *entities)
+		return snapshot
+	}
+	// Some custom keyrings expose the same "all entities" convention as the
+	// v2 KeyRing. Use it when available so one read transaction cannot switch
+	// to a different entity set halfway through.
+	if provider, ok := keyring.(interface{ EntitiesById(uint64) []*Entity }); ok {
+		if entities := provider.EntitiesById(0); len(entities) > 0 {
+			seen := make(map[*Entity]struct{}, len(entities))
+			snapshot := make(EntityList, 0, len(entities))
+			for _, entity := range entities {
+				if entity == nil {
+					continue
+				}
+				if _, ok := seen[entity]; ok {
+					continue
+				}
+				seen[entity] = struct{}{}
+				snapshot = append(snapshot, entity)
+			}
+			if len(snapshot) > 0 {
+				return snapshot
+			}
+		}
+	}
+	return keyring
+}
+
+// cloneHashState copies a partially filled message hash. This keeps the
+// streaming hash pristine while one candidate key is tried, so a later
+// signature packet (or another candidate) is not verified with a suffix left
+// behind by the previous attempt.
+func cloneHashState(state hash.Hash, hashFunc crypto.Hash) (hash.Hash, bool) {
+	if state == nil {
+		return nil, false
+	}
+	marshaler, ok := state.(encoding.BinaryMarshaler)
+	if !ok {
+		return nil, false
+	}
+	serialized, err := marshaler.MarshalBinary()
+	if err != nil {
+		return nil, false
+	}
+	clone := hashFunc.New()
+	unmarshaler, ok := clone.(encoding.BinaryUnmarshaler)
+	if !ok {
+		return nil, false
+	}
+	if err := unmarshaler.UnmarshalBinary(serialized); err != nil {
+		return nil, false
+	}
+	return clone, true
+}
+
+// checkKeySelectionDetails performs the message-signature checks against one
+// captured selection. The time was captured once for the verification
+// transaction, so key expiry, revocation and signature expiry cannot be
+// evaluated against different instants during a retry.
+func checkKeySelectionDetails(selection *keySelection, signature *packet.Signature, config *packet.Config) error {
+	if selection == nil {
+		return errors.InvalidArgumentError("openpgp: no key selection")
+	}
+	key := &selection.key
+	now := selection.now
+	if key.Entity == nil {
+		return errors.InvalidArgumentError("openpgp: selected key has no entity")
+	}
+	if selection.primaryKey == nil {
+		return errors.InvalidArgumentError("openpgp: selected entity has no primary key")
+	}
+
+	sigsToCheck := []*packet.Signature{signature, selection.primarySelfSignature}
+	if selection.signedBySubKey {
+		sigsToCheck = append(sigsToCheck, key.SelfSignature)
+		if key.SelfSignature != nil {
+			sigsToCheck = append(sigsToCheck, key.SelfSignature.EmbeddedSignature)
+		}
+	}
+	for _, sig := range sigsToCheck {
+		if sig == nil {
+			continue
+		}
+		for _, notation := range sig.Notations {
+			if notation.IsCritical && !config.KnownNotation(notation.Name) {
+				return errors.SignatureError("unknown critical notation: " + notation.Name)
+			}
+		}
+	}
+	if revoked(selection.entityRevocations, now) || // primary key is revoked
+		(selection.signedBySubKey && revoked(key.Revocations, now)) || // subkey is revoked
+		(selection.hasPrimaryIdentity && revoked(selection.primaryIdentityRevocations, now)) { // primary identity is revoked for v4
+		return errors.ErrKeyRevoked
+	}
+	if selection.requiredUsage != 0 {
+		usageSignature := key.SelfSignature
+		if !selection.signedBySubKey {
+			usageSignature = selection.primarySelfSignature
+		}
+		if usageSignature != nil && !keyMatchesUsage(usageSignature, selection.requiredUsage) {
+			return errors.InvalidArgumentError("openpgp: selected key does not have the required usage")
+		}
+	}
+	if selection.primarySelfSignature != nil && selection.primaryKey.KeyExpired(selection.primarySelfSignature, now) { // primary key is expired
+		return errors.ErrKeyExpired
+	}
+	if selection.signedBySubKey && key.SelfSignature != nil && key.PublicKey.KeyExpired(key.SelfSignature, now) { // subkey is expired
+		return errors.ErrKeyExpired
+	}
+	for _, sig := range sigsToCheck {
+		if sig != nil && sig.SigExpired(now) { // any of the relevant signatures are expired
+			return errors.ErrSignatureExpired
+		}
+	}
+	return nil
 }

@@ -5,8 +5,12 @@
 package v2
 
 import (
+	"bytes"
+	"crypto"
+	"encoding"
 	goerrors "errors"
 	"fmt"
+	"hash"
 	"io"
 	"time"
 
@@ -247,63 +251,102 @@ func (e *Entity) SigningKeyById(now time.Time, id uint64, config *packet.Config)
 }
 
 func (e *Entity) signingKeyByIdUsage(now time.Time, id uint64, flags int, config *packet.Config) (Key, error) {
-	primarySelfSignature, err := e.VerifyPrimaryKey(now, config)
+	return e.signingKeyByIdUsageFingerprint(now, id, flags, nil, config)
+}
+
+// signingKeyByIdUsageFingerprint is signingKeyByIdUsage with the issuer
+// fingerprint as an additional identity constraint. When a fingerprint is
+// present, a key id collision must not cause the selection to fall back to a
+// different key or entity.
+func (e *Entity) signingKeyByIdUsageFingerprint(now time.Time, id uint64, flags int, fingerprint []byte, config *packet.Config) (Key, error) {
+	keys, err := e.signingKeysByIdUsageFingerprint(now, id, flags, fingerprint, config)
 	if err != nil {
 		return Key{}, err
+	}
+	return keys[0], nil
+}
+
+// signingKeysByIdUsageFingerprint returns every key in the entity that can
+// satisfy the requested issuer and usage at now. Verification needs the whole
+// set when a key id is shared by a primary key and one or more subkeys: trying
+// only the most recently bound subkey would attribute the signature to a key
+// that did not make it.
+func (e *Entity) signingKeysByIdUsageFingerprint(now time.Time, id uint64, flags int, fingerprint []byte, config *packet.Config) ([]Key, error) {
+	primarySelfSignature, err := e.VerifyPrimaryKey(now, config)
+	if err != nil {
+		return nil, err
 	}
 
 	if err = checkKeyRequirements(e.PrimaryKey, config); err != nil {
 		// The primary key produces weak signatures
-		return Key{}, err
+		return nil, err
 	}
 
-	// Iterate the keys to find the newest, unexpired one.
-	candidateSubkey := -1
+	// Iterate the keys to find every matching, currently valid subkey. The
+	// newest key is kept first to preserve the historical signing preference,
+	// but all candidates are returned for verification.
+	type subkeyCandidate struct {
+		key Key
+	}
+	var subkeyCandidates []subkeyCandidate
+	bestSubkey := -1
 	var maxTime time.Time
-	var selectedSubkeySelfSig *packet.Signature
-	for idx, subkey := range e.Subkeys {
+	for _, subkey := range e.Subkeys {
 		subkeySelfSig, err := subkey.Verify(now, config)
 		if err == nil &&
 			(flags&packet.KeyFlagCertify == 0 || isValidCertificationKey(subkeySelfSig, subkey.PublicKey.PubKeyAlgo, config)) &&
 			(flags&packet.KeyFlagSign == 0 || isValidSigningKey(subkeySelfSig, subkey.PublicKey.PubKeyAlgo, config)) &&
 			checkKeyRequirements(subkey.PublicKey, config) == nil &&
-			(maxTime.IsZero() ||
+			(id == 0 || subkey.PublicKey.KeyId == id) &&
+			fingerprintMatches(subkey.PublicKey.Fingerprint, fingerprint) {
+			subkeyCandidates = append(subkeyCandidates, subkeyCandidate{
+				key: Key{
+					Entity:               subkey.Primary,
+					PrimarySelfSignature: primarySelfSignature,
+					PublicKey:            subkey.PublicKey,
+					PrivateKey:           subkey.PrivateKey,
+					SelfSignature:        subkeySelfSig,
+				},
+			})
+			if maxTime.IsZero() ||
 				subkeySelfSig.CreationTime.After(maxTime) ||
-				(subkeySelfSig.CreationTime.Equal(maxTime) && subkey.IsPQ())) &&
-			(id == 0 || subkey.PublicKey.KeyId == id) {
-			candidateSubkey = idx
-			maxTime = subkeySelfSig.CreationTime
-			selectedSubkeySelfSig = subkeySelfSig
+				(subkeySelfSig.CreationTime.Equal(maxTime) && subkey.IsPQ()) {
+				bestSubkey = len(subkeyCandidates) - 1
+				maxTime = subkeySelfSig.CreationTime
+			}
 		}
 	}
 
-	if candidateSubkey != -1 {
-		subkey := &e.Subkeys[candidateSubkey]
-		return Key{
-			Entity:               subkey.Primary,
-			PrimarySelfSignature: primarySelfSignature,
-			PublicKey:            subkey.PublicKey,
-			PrivateKey:           subkey.PrivateKey,
-			SelfSignature:        selectedSubkeySelfSig,
-		}, nil
+	var keys []Key
+	if bestSubkey != -1 {
+		keys = append(keys, subkeyCandidates[bestSubkey].key)
+		for index := range subkeyCandidates {
+			if index == bestSubkey {
+				continue
+			}
+			keys = append(keys, subkeyCandidates[index].key)
+		}
 	}
 
 	// If we don't have any subkeys for signing and the primary key
 	// is marked as OK to sign with, then we can use it.
 	if (flags&packet.KeyFlagCertify == 0 || isValidCertificationKey(primarySelfSignature, e.PrimaryKey.PubKeyAlgo, config)) &&
 		(flags&packet.KeyFlagSign == 0 || isValidSigningKey(primarySelfSignature, e.PrimaryKey.PubKeyAlgo, config)) &&
-		(id == 0 || e.PrimaryKey.KeyId == id) {
-		return Key{
+		(id == 0 || e.PrimaryKey.KeyId == id) &&
+		fingerprintMatches(e.PrimaryKey.Fingerprint, fingerprint) {
+		keys = append(keys, Key{
 			Entity:               e,
 			PrimarySelfSignature: primarySelfSignature,
 			PublicKey:            e.PrimaryKey,
 			PrivateKey:           e.PrivateKey,
 			SelfSignature:        primarySelfSignature,
-		}, nil
+		})
 	}
 
-	// No keys with a valid Signing Flag or no keys matched the id passed in
-	return Key{}, errors.StructuralError("no valid signing or verifying key found")
+	if len(keys) == 0 {
+		return nil, errors.StructuralError("no valid signing or verifying key found")
+	}
+	return keys, nil
 }
 
 // Revoked returns whether the entity has any direct key revocation signatures.
@@ -851,4 +894,128 @@ func isValidEncryptionKey(signature *packet.Signature, algo packet.PublicKeyAlgo
 	}
 
 	return config.AllowAllKeyFlagsWhenMissing()
+}
+
+// snapshotKeyRing freezes the entity list of the built-in keyring
+// implementation for one read/verification transaction. Custom KeyRing
+// implementations are used as-is; candidate entities are still captured when
+// they are selected so a later lookup cannot replace the signer identity.
+func snapshotKeyRing(keyring KeyRing) KeyRing {
+	if keyring == nil {
+		return nil
+	}
+	if entities, ok := keyring.(EntityList); ok {
+		snapshot := make(EntityList, len(entities))
+		copy(snapshot, entities)
+		return snapshot
+	}
+	if entities, ok := keyring.(*EntityList); ok && entities != nil {
+		snapshot := make(EntityList, len(*entities))
+		copy(snapshot, *entities)
+		return snapshot
+	}
+	// EntityList treats key id zero as "all entities". Use the same convention
+	// when a custom KeyRing supports it, so a keyring rotated during
+	// decryption cannot change the signer entity used later in the same
+	// message transaction.
+	if entities := keyring.EntitiesById(0); len(entities) > 0 {
+		seen := make(map[*Entity]struct{}, len(entities))
+		snapshot := make(EntityList, 0, len(entities))
+		for _, entity := range entities {
+			if entity == nil {
+				continue
+			}
+			if _, ok := seen[entity]; ok {
+				continue
+			}
+			seen[entity] = struct{}{}
+			snapshot = append(snapshot, entity)
+		}
+		if len(snapshot) > 0 {
+			return snapshot
+		}
+	}
+	return keyring
+}
+
+func fingerprintMatches(fingerprint, expected []byte) bool {
+	return len(expected) == 0 || bytes.Equal(fingerprint, expected)
+}
+
+func entityMatchesFingerprint(entity *Entity, fingerprint []byte) bool {
+	if entity == nil || entity.PrimaryKey == nil {
+		return false
+	}
+	if bytes.Equal(entity.PrimaryKey.Fingerprint, fingerprint) {
+		return true
+	}
+	for index := range entity.Subkeys {
+		subkey := &entity.Subkeys[index]
+		if subkey.PublicKey != nil && bytes.Equal(subkey.PublicKey.Fingerprint, fingerprint) {
+			return true
+		}
+	}
+	return false
+}
+
+// entitiesByIdFingerprint resolves the entities that may contain the issuer.
+// If a fingerprint is supplied, an entity whose key id merely collides is not
+// a candidate.
+func entitiesByIdFingerprint(keyring KeyRing, id uint64, fingerprint []byte) []*Entity {
+	if keyring == nil {
+		return nil
+	}
+	entities := keyring.EntitiesById(id)
+	if len(fingerprint) == 0 {
+		return entities
+	}
+	filtered := make([]*Entity, 0, len(entities))
+	for _, entity := range entities {
+		if entityMatchesFingerprint(entity, fingerprint) {
+			filtered = append(filtered, entity)
+		}
+	}
+	return filtered
+}
+
+// subkeyForKey returns the subkey in entity that owns publicKey. It is used to
+// re-check revocation state on the same key that was selected, never on a
+// same-id key from another entity.
+func subkeyForKey(entity *Entity, publicKey *packet.PublicKey) *Subkey {
+	if entity == nil || publicKey == nil {
+		return nil
+	}
+	for index := range entity.Subkeys {
+		subkey := &entity.Subkeys[index]
+		if subkey.PublicKey == publicKey {
+			return subkey
+		}
+	}
+	return nil
+}
+
+// cloneHashState copies the accumulated message hash so that trying another
+// candidate key for the same signature does not feed the first candidate's
+// signature suffix into the second verification.
+func cloneHashState(state hash.Hash, hashFunc crypto.Hash) (hash.Hash, bool) {
+	if state == nil {
+		return nil, false
+	}
+	marshaler, ok := state.(encoding.BinaryMarshaler)
+	if !ok {
+		return nil, false
+	}
+	serialized, err := marshaler.MarshalBinary()
+	if err != nil {
+		return nil, false
+	}
+	clone := hashFunc.New()
+	unmarshaler, ok := clone.(encoding.BinaryUnmarshaler)
+	if !ok {
+		return nil, false
+	}
+	if err := unmarshaler.UnmarshalBinary(serialized); err != nil {
+		return nil, false
+	}
+	return clone, true
 }

@@ -119,6 +119,10 @@ func ReadMessage(r io.Reader, keyring KeyRing, prompt PromptFunction, config *pa
 	md = new(MessageDetails)
 	md.IsEncrypted = true
 	md.CheckRecipients = config.IntendedRecipients()
+	// Freeze the built-in keyring view for the whole message transaction.
+	// Recipient and signer resolution must not observe two keyring
+	// generations.
+	keyring = snapshotKeyRing(keyring)
 
 	// The message, if encrypted, starts with a number of packets
 	// containing an encrypted decryption key. The decryption key is either
@@ -291,6 +295,11 @@ type SignatureCandidate struct {
 	SignatureError    error             // nil if the signature is valid or not checked.
 	CorrespondingSig  *packet.Signature // the candidate's signature packet
 	Hash, WrappedHash hash.Hash         // hashes for this signature candidate (OPS)
+
+	// signedByEntities holds the entities captured when the signature was
+	// parsed. Verification tries these entities in order; it never resolves
+	// the issuer again from a possibly rotated keyring.
+	signedByEntities []*Entity
 }
 
 func newSignatureCandidate(ops *packet.OnePassSignature) (sigCandidate *SignatureCandidate) {
@@ -389,9 +398,10 @@ FindLiteralData:
 			sigCandidate := newSignatureCandidate(p)
 			md.IsSigned = true
 			if keyring != nil {
-				keys := keyring.EntitiesById(p.KeyId)
-				if len(keys) > 0 {
-					sigCandidate.SignedByEntity = keys[0]
+				entities := entitiesByIdFingerprint(keyring, p.KeyId, p.KeyFingerprint)
+				sigCandidate.signedByEntities = entities
+				if len(entities) > 0 {
+					sigCandidate.SignedByEntity = entities[0]
 				}
 			}
 			// If a message contains more than one one-pass signature, then the Signature packets bracket the message
@@ -404,9 +414,10 @@ FindLiteralData:
 			}
 			md.IsSigned = true
 			if keyring != nil {
-				keys := keyring.EntitiesById(sigCandidate.IssuerKeyId)
-				if len(keys) > 0 {
-					sigCandidate.SignedByEntity = keys[0]
+				entities := entitiesByIdFingerprint(keyring, sigCandidate.IssuerKeyId, sigCandidate.IssuerFingerprint)
+				sigCandidate.signedByEntities = entities
+				if len(entities) > 0 {
+					sigCandidate.SignedByEntity = entities[0]
 				}
 			}
 			md.SignatureCandidates = append([]*SignatureCandidate{sigCandidate}, md.SignatureCandidates...)
@@ -583,22 +594,79 @@ func (scr *signatureCheckReader) Read(buf []byte) (int, error) {
 				}
 				if candidate.SignatureError == nil {
 					sig := candidate.CorrespondingSig
-					if candidate.SignedByEntity == nil {
+					entities := candidate.signedByEntities
+					if len(entities) == 0 && candidate.SignedByEntity != nil {
+						entities = []*Entity{candidate.SignedByEntity}
+					}
+					if len(entities) == 0 {
 						candidate.SignatureError = errors.ErrUnknownIssuer
 						scr.md.SignatureError = candidate.SignatureError
 					} else {
-						// Verify and retrieve signing key at signature creation time
-						key, err := candidate.SignedByEntity.signingKeyByIdUsage(sig.CreationTime, candidate.IssuerKeyId, packet.KeyFlagSign, scr.config)
-						if err != nil {
-							candidate.SignatureError = err
+						// Try only candidates captured for this signature
+						// transaction. Once a candidate cryptographically
+						// verifies, its own entity's revocation, usage and
+						// time checks are final; another entity cannot
+						// supply a more convenient conclusion.
+						var selected *Key
+						var lastError error
+						pristineHash, canClone := cloneHashState(candidate.Hash, candidate.HashAlgorithm)
+						attempt := 0
+						stop := false
+						for _, entity := range entities {
+							keys, keyError := entity.signingKeysByIdUsageFingerprint(sig.CreationTime, candidate.IssuerKeyId, packet.KeyFlagSign, candidate.IssuerFingerprint, scr.config)
+							if keyError != nil {
+								lastError = keyError
+								if len(candidate.IssuerFingerprint) > 0 {
+									stop = true
+									break
+								}
+								continue
+							}
+							for keyIndex := range keys {
+								verificationHash := candidate.Hash
+								if attempt > 0 {
+									if !canClone {
+										stop = true
+										break
+									}
+									cloned, ok := cloneHashState(pristineHash, candidate.HashAlgorithm)
+									if !ok {
+										stop = true
+										break
+									}
+									verificationHash = cloned
+								}
+								attempt++
+								key := &keys[keyIndex]
+								if err := key.PublicKey.VerifySignature(verificationHash, sig); err != nil {
+									lastError = err
+									// A fingerprint-pinned issuer is one
+									// identity: do not borrow a same-id
+									// key's trust from a different entity.
+									if len(candidate.IssuerFingerprint) > 0 {
+										stop = true
+										break
+									}
+									continue
+								}
+								selected = key
+								candidate.SignedByEntity = entity
+								stop = true
+								break
+							}
+							if stop {
+								break
+							}
+						}
+						if selected == nil {
+							if lastError == nil {
+								lastError = errors.ErrUnknownIssuer
+							}
+							candidate.SignatureError = lastError
 							continue
-						} else {
-							candidate.SignedBy = &key
 						}
-						signatureError := key.PublicKey.VerifySignature(candidate.Hash, sig)
-						if signatureError == nil {
-							signatureError = checkMessageSignatureDetails(&key, sig, scr.config)
-						}
+						candidate.SignedBy = selected
+						signatureError := checkMessageSignatureDetails(selected, sig, scr.config)
 						if !scr.md.IsSymmetricallyEncrypted && len(sig.IntendedRecipients) > 0 && scr.md.CheckRecipients && signatureError == nil {
 							if !scr.md.IsEncrypted {
 								signatureError = errors.SignatureError("intended recipients in non-encrypted message")
@@ -708,6 +776,7 @@ func verifyDetachedSignatureReader(keyring KeyRing, signed, signature io.Reader,
 		CheckRecipients: false,
 		IsSigned:        true,
 	}
+	keyring = snapshotKeyRing(keyring)
 
 	packets := packet.NewReader(signature)
 	for {
@@ -728,9 +797,10 @@ func verifyDetachedSignatureReader(keyring KeyRing, signed, signature io.Reader,
 		}
 		md.SignatureCandidates = append(md.SignatureCandidates, candidate)
 
-		keys := keyring.EntitiesById(candidate.IssuerKeyId)
-		if len(keys) > 0 {
-			candidate.SignedByEntity = keys[0]
+		entities := entitiesByIdFingerprint(keyring, candidate.IssuerKeyId, candidate.IssuerFingerprint)
+		candidate.signedByEntities = entities
+		if len(entities) > 0 {
+			candidate.SignedByEntity = entities[0]
 		}
 	}
 
@@ -780,12 +850,34 @@ func checkMessageSignatureDetails(verifiedKey *Key, signature *packet.Signature,
 		return errors.ErrSignatureOlderThanKey
 	}
 
+	if verifiedKey.Entity != nil && verifiedKey.Entity.PrimaryKey != nil {
+		// Re-check revocation at the same time that was used to select the
+		// signature key. This catches a revocation added to the selected
+		// entity while the signed body was being read, without consulting a
+		// different entity that happens to share the key id.
+		if verifiedKey.Entity.Revoked(signature.CreationTime) {
+			return errors.ErrKeyRevoked
+		}
+		if !verifiedKey.IsPrimary() {
+			if subkey := subkeyForKey(verifiedKey.Entity, verifiedKey.PublicKey); subkey != nil &&
+				subkey.Revoked(verifiedKey.SelfSignature, signature.CreationTime) {
+				return errors.ErrKeyRevoked
+			}
+		}
+	}
+
 	sigsToCheck := []*packet.Signature{signature, verifiedKey.PrimarySelfSignature}
 	if !verifiedKey.IsPrimary() {
-		sigsToCheck = append(sigsToCheck, verifiedKey.SelfSignature, verifiedKey.SelfSignature.EmbeddedSignature)
+		sigsToCheck = append(sigsToCheck, verifiedKey.SelfSignature)
+		if verifiedKey.SelfSignature != nil {
+			sigsToCheck = append(sigsToCheck, verifiedKey.SelfSignature.EmbeddedSignature)
+		}
 	}
 	var errs []error
 	for _, sig := range sigsToCheck {
+		if sig == nil {
+			continue
+		}
 		var time time.Time
 		if sig == signature {
 			time = config.Now()
