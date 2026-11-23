@@ -6,6 +6,7 @@
 package openpgp // import "github.com/ProtonMail/go-crypto/openpgp"
 
 import (
+	"bytes"
 	"crypto"
 	_ "crypto/sha256"
 	_ "crypto/sha512"
@@ -28,6 +29,9 @@ var MessageType = "PGP MESSAGE"
 
 // readArmored reads an armored block with the given type.
 func readArmored(r io.Reader, expectedType string) (body io.Reader, err error) {
+	if r == nil {
+		return nil, errors.InvalidArgumentError("nil armored reader")
+	}
 	block, err := armor.Decode(r)
 	if err != nil {
 		return
@@ -484,78 +488,154 @@ func CheckDetachedSignatureAndHash(keyring KeyRing, signed, signature io.Reader,
 	return
 }
 
+type detachedSignatureCandidate struct {
+	signature *packet.Signature
+	keys      []Key
+}
+
 func verifyDetachedSignature(keyring KeyRing, signed, signature io.Reader, expectedHashes []crypto.Hash, checkHashes bool, config *packet.Config) (sig *packet.Signature, signer *Entity, err error) {
-	var issuerKeyId uint64
-	var hashFunc crypto.Hash
-	var sigType packet.SignatureType
-	var keys []Key
-	var p packet.Packet
+	if signature == nil {
+		return nil, nil, errors.InvalidArgumentError("nil signature reader")
+	}
+	if signed == nil {
+		signed = bytes.NewReader(nil)
+	}
 
 	packets := packet.NewReader(signature)
+	var candidates []detachedSignatureCandidate
 	for {
-		p, err = packets.Next()
+		p, err := packets.Next()
 		if err == io.EOF {
-			return nil, nil, errors.ErrUnknownIssuer
+			break
 		}
 		if err != nil {
 			return nil, nil, err
 		}
 
-		var ok bool
-		sig, ok = p.(*packet.Signature)
-		if !ok {
-			return nil, nil, errors.StructuralError("non signature packet found")
-		}
-		if sig.IssuerKeyId == nil {
-			return nil, nil, errors.StructuralError("signature doesn't have an issuer")
-		}
-		issuerKeyId = *sig.IssuerKeyId
-		hashFunc = sig.Hash
-		sigType = sig.SigType
-		if checkHashes {
-			matchFound := false
-			// check for hashes
-			for _, expectedHash := range expectedHashes {
-				if hashFunc == expectedHash {
-					matchFound = true
-					break
+		switch p := p.(type) {
+		case *packet.Signature:
+			if p.IssuerKeyId == nil {
+				return nil, nil, errors.StructuralError("signature doesn't have an issuer")
+			}
+			if checkHashes {
+				matchFound := false
+				for _, expectedHash := range expectedHashes {
+					if p.Hash == expectedHash {
+						matchFound = true
+						break
+					}
+				}
+				if !matchFound {
+					// Preserve the historical behavior for signatures encountered
+					// before the first usable candidate: a hash mismatch is a hard
+					// error. Signatures after a candidate are extra, independently
+					// verified packets and must not make an otherwise allowed
+					// signature fail.
+					if len(candidates) == 0 {
+						return nil, nil, errors.StructuralError("hash algorithm or salt mismatch with cleartext message headers")
+					}
+					continue
 				}
 			}
-			if !matchFound {
-				return nil, nil, errors.StructuralError("hash algorithm or salt mismatch with cleartext message headers")
+			if keyring == nil {
+				continue
 			}
-		}
-		keys = keyring.KeysByIdUsage(issuerKeyId, packet.KeyFlagSign)
-		if len(keys) > 0 {
-			break
+			keys := keyring.KeysByIdUsage(*p.IssuerKeyId, packet.KeyFlagSign)
+			if len(keys) > 0 {
+				candidates = append(candidates, detachedSignatureCandidate{signature: p, keys: keys})
+			}
+		case packet.Padding:
+			// Padding packets are part of the OpenPGP packet stream and are
+			// already consumed by the packet reader. They do not contribute a
+			// signature and must not prevent verification of the signatures
+			// around them.
+		default:
+			return nil, nil, errors.StructuralError("non signature packet found")
 		}
 	}
 
-	if len(keys) == 0 {
-		panic("unreachable")
+	if len(candidates) == 0 {
+		return nil, nil, errors.ErrUnknownIssuer
 	}
 
+	// Almost all detached signatures contain exactly one signature packet and
+	// match exactly one key. Keep that common case streaming and only buffer the
+	// signed data when a signature needs to be replayed (multiple signatures or
+	// several keys with the same issuer key id).
+	verifyAttempts := 0
+	for _, candidate := range candidates {
+		verifyAttempts += len(candidate.keys)
+	}
+	if verifyAttempts == 1 {
+		candidate := candidates[0]
+		return verifyDetachedSignatureWithKey(signed, candidate.signature, candidate.keys[0], config)
+	}
+
+	signedData, err := io.ReadAll(signed)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var lastErr error
+	var detailsSig *packet.Signature
+	var detailsSigner *Entity
+	var detailsErr error
+	for _, candidate := range candidates {
+		for _, key := range candidate.keys {
+			if key.Entity == nil || key.PublicKey == nil {
+				lastErr = errors.ErrUnknownIssuer
+				continue
+			}
+			if err := verifyDetachedSignatureHash(bytes.NewReader(signedData), candidate.signature, key.PublicKey); err != nil {
+				lastErr = err
+				continue
+			}
+			if err := checkMessageSignatureDetails(&key, candidate.signature, config); err != nil {
+				if detailsErr == nil {
+					detailsSig = candidate.signature
+					detailsSigner = key.Entity
+					detailsErr = err
+				}
+				continue
+			}
+			return candidate.signature, key.Entity, nil
+		}
+	}
+
+	if detailsErr != nil {
+		return detailsSig, detailsSigner, detailsErr
+	}
+	if lastErr == nil {
+		lastErr = errors.ErrUnknownIssuer
+	}
+	return nil, nil, lastErr
+}
+
+func verifyDetachedSignatureWithKey(signed io.Reader, sig *packet.Signature, key Key, config *packet.Config) (verifiedSig *packet.Signature, signer *Entity, err error) {
+	if key.Entity == nil || key.PublicKey == nil {
+		return nil, nil, errors.ErrUnknownIssuer
+	}
+	if err := verifyDetachedSignatureHash(signed, sig, key.PublicKey); err != nil {
+		return nil, nil, err
+	}
+	return sig, key.Entity, checkMessageSignatureDetails(&key, sig, config)
+}
+
+func verifyDetachedSignatureHash(signed io.Reader, sig *packet.Signature, publicKey *packet.PublicKey) error {
 	h, err := sig.PrepareVerify()
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
-	wrappedHash, err := wrapHashForSignature(h, sigType)
+	wrappedHash, err := wrapHashForSignature(h, sig.SigType)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
 
 	if _, err := io.Copy(wrappedHash, signed); err != nil && err != io.EOF {
-		return nil, nil, err
+		return err
 	}
 
-	for _, key := range keys {
-		err = key.PublicKey.VerifySignature(h, sig)
-		if err == nil {
-			return sig, key.Entity, checkMessageSignatureDetails(&key, sig, config)
-		}
-	}
-
-	return nil, nil, err
+	return publicKey.VerifySignature(h, sig)
 }
 
 // CheckArmoredDetachedSignature performs the same actions as

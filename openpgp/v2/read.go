@@ -31,6 +31,9 @@ var MessageType = "PGP MESSAGE"
 
 // readArmored reads an armored block with the given type.
 func readArmored(r io.Reader, expectedType string) (body io.Reader, err error) {
+	if r == nil {
+		return nil, errors.InvalidArgumentError("nil armored reader")
+	}
 	block, err := armor.Decode(r)
 	if err != nil {
 		return
@@ -698,11 +701,19 @@ func verifyDetachedSignature(keyring KeyRing, signed, signature io.Reader, confi
 	if md.SignatureError != nil {
 		return nil, nil, md.SignatureError
 	}
+	if md.Signature == nil || md.SignedBy == nil || md.SignedBy.Entity == nil {
+		return nil, nil, errors.ErrUnknownIssuer
+	}
 	return md.Signature, md.SignedBy.Entity, nil
 }
 
 func verifyDetachedSignatureReader(keyring KeyRing, signed, signature io.Reader, config *packet.Config) (md *MessageDetails, err error) {
-	var p packet.Packet
+	if signature == nil {
+		return nil, errors.InvalidArgumentError("nil signature reader")
+	}
+	if signed == nil {
+		signed = bytes.NewReader(nil)
+	}
 	md = &MessageDetails{
 		IsEncrypted:     false,
 		CheckRecipients: false,
@@ -711,26 +722,34 @@ func verifyDetachedSignatureReader(keyring KeyRing, signed, signature io.Reader,
 
 	packets := packet.NewReader(signature)
 	for {
-		p, err = packets.Next()
+		p, err := packets.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			return nil, err
 		}
-		sig, ok := p.(*packet.Signature)
-		if !ok {
-			continue
-		}
-		candidate, err := newSignatureCandidateFromSignature(sig)
-		if err != nil {
-			return nil, err
-		}
-		md.SignatureCandidates = append(md.SignatureCandidates, candidate)
 
-		keys := keyring.EntitiesById(candidate.IssuerKeyId)
-		if len(keys) > 0 {
-			candidate.SignedByEntity = keys[0]
+		switch p := p.(type) {
+		case *packet.Signature:
+			candidate, err := newSignatureCandidateFromSignature(p)
+			if err != nil {
+				return nil, err
+			}
+			md.SignatureCandidates = append(md.SignatureCandidates, candidate)
+
+			if keyring != nil {
+				keys := keyring.EntitiesById(candidate.IssuerKeyId)
+				if len(keys) > 0 {
+					candidate.SignedByEntity = keys[0]
+				}
+			}
+		case packet.Padding:
+			// Padding packets are consumed by the packet reader and are not
+			// signatures. Ignore them while keeping the signature stream
+			// boundary tied to the complete reader.
+		default:
+			return nil, errors.StructuralError("non signature packet found")
 		}
 	}
 

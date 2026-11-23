@@ -84,3 +84,79 @@ func TestReadV1NilIssuerNoPanic(t *testing.T) {
 	}
 	io.Copy(io.Discard, md.UnverifiedBody)
 }
+
+func uid34371DetachedSignatureBytes(t *testing.T) []byte {
+	t.Helper()
+	signature, err := io.ReadAll(readerFromHex(detachedSignatureHex))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signature
+}
+
+func TestUid34371DetachedSignatureTrailingMalformedData(t *testing.T) {
+	kring, _ := ReadKeyRing(readerFromHex(testKeys1And2Hex))
+	signature := append(uid34371DetachedSignatureBytes(t), 0x00)
+
+	signer, err := CheckDetachedSignature(
+		kring,
+		bytes.NewBufferString(signedInput),
+		bytes.NewReader(signature),
+		nil,
+	)
+	if err == nil {
+		t.Fatal("accepted a detached signature with trailing malformed data")
+	}
+	if signer != nil {
+		t.Fatal("returned a signer for a detached signature with trailing malformed data")
+	}
+}
+
+func TestUid34371DetachedSignatureEmptyOrMissingKeyring(t *testing.T) {
+	kring, _ := ReadKeyRing(readerFromHex(testKeys1And2Hex))
+
+	for _, test := range []struct {
+		name      string
+		keyring   KeyRing
+		signature io.Reader
+	}{
+		{name: "empty signature", keyring: kring, signature: bytes.NewReader(nil)},
+		{name: "missing keyring", keyring: nil, signature: readerFromHex(detachedSignatureHex)},
+		{name: "nil signature reader", keyring: kring, signature: nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			signer, err := CheckDetachedSignature(
+				test.keyring,
+				bytes.NewBufferString(signedInput),
+				test.signature,
+				nil,
+			)
+			if err == nil {
+				t.Fatal("accepted a detached signature without a verifiable signer")
+			}
+			if signer != nil {
+				t.Fatal("returned a signer without a verifiable signature")
+			}
+		})
+	}
+}
+
+func TestUid34371DetachedSignatureMultipleSignaturesAndPadding(t *testing.T) {
+	kring, _ := ReadKeyRing(readerFromHex(testKeys1And2Hex))
+	first := uid34371DetachedSignatureBytes(t)
+	signature := append(append([]byte{}, first...), first...)
+	signature = append(signature, secWrapPacket(21, []byte{0x00, 0x00, 0x00})...)
+
+	signer, err := CheckDetachedSignature(
+		kring,
+		bytes.NewBufferString(signedInput),
+		bytes.NewReader(signature),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("signature error: %s", err)
+	}
+	if signer == nil || signer.PrimaryKey.KeyId != testKey1KeyId {
+		t.Fatal("did not return the expected signer")
+	}
+}
