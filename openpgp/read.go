@@ -301,10 +301,8 @@ FindLiteralData:
 
 	if md.IsSigned && md.SignatureError == nil {
 		md.UnverifiedBody = &signatureCheckReader{packets, h, wrappedHash, md, config}
-	} else if md.decrypted != nil {
-		md.UnverifiedBody = &checkReader{md, false}
 	} else {
-		md.UnverifiedBody = md.LiteralData.Body
+		md.UnverifiedBody = &checkReader{md, packets, false}
 	}
 
 	return md, nil
@@ -350,10 +348,13 @@ func hashForSignature(hashFunc crypto.Hash, sigType packet.SignatureType, sigSal
 }
 
 // checkReader wraps an io.Reader from a LiteralData packet. When it sees EOF
-// it closes the ReadCloser from any SymmetricallyEncrypted packet to trigger
-// MDC checks.
+// it consumes the remainder of the packet stream and closes the ReadCloser
+// from any SymmetricallyEncrypted packet to trigger MDC checks. The message
+// is only complete once the whole packet stream has been consumed: any
+// trailing, unparsable data invalidates it.
 type checkReader struct {
 	md      *MessageDetails
+	packets *packet.Reader
 	checked bool
 }
 
@@ -364,16 +365,27 @@ func (cr *checkReader) Read(buf []byte) (int, error) {
 			// Only check once
 			return n, io.EOF
 		}
-		mdcErr := cr.md.decrypted.Close()
-		if mdcErr != nil {
-			return n, mdcErr
+		for {
+			_, err := cr.packets.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return n, errors.HandleSensitiveParsingError(err, cr.md.decrypted != nil)
+			}
+		}
+		if cr.md.decrypted != nil {
+			mdcErr := cr.md.decrypted.Close()
+			if mdcErr != nil {
+				return n, mdcErr
+			}
 		}
 		cr.checked = true
 		return n, io.EOF
 	}
 
 	if sensitiveParsingError != nil {
-		return n, errors.HandleSensitiveParsingError(sensitiveParsingError, true)
+		return n, errors.HandleSensitiveParsingError(sensitiveParsingError, cr.md.decrypted != nil)
 	}
 
 	return n, nil
@@ -403,8 +415,18 @@ func (scr *signatureCheckReader) Read(buf []byte) (int, error) {
 		var readError error
 		var sig *packet.Signature
 
-		p, readError = scr.packets.Next()
-		for readError == nil {
+		for {
+			p, readError = scr.packets.Next()
+			if readError == io.EOF {
+				break
+			}
+			if readError != nil {
+				// The packet stream did not terminate cleanly (e.g.
+				// trailing corrupt data or a cancelled underlying
+				// reader), so the message must not be considered
+				// complete.
+				return n, errors.HandleSensitiveParsingError(readError, readsDecryptedData)
+			}
 			var ok bool
 			if sig, ok = p.(*packet.Signature); ok {
 				if sig.Version == 5 && (sig.SigType == 0x00 || sig.SigType == 0x01) {
@@ -424,8 +446,6 @@ func (scr *signatureCheckReader) Read(buf []byte) (int, error) {
 					scr.md.UnverifiedSignatures = append(scr.md.UnverifiedSignatures, sig)
 				}
 			}
-
-			p, readError = scr.packets.Next()
 		}
 
 		if scr.md.SignedBy != nil && scr.md.Signature == nil {

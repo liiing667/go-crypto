@@ -23,7 +23,7 @@ import (
 //	Headers
 //
 //	base64-encoded Bytes
-//	'=' base64 encoded checksum (optional) not checked anymore
+//	'=' base64 encoded checksum (optional)
 //	-----END Type-----
 //
 // where Headers is a possibly empty sequence of Key: Value lines.
@@ -44,11 +44,16 @@ var armorStart = []byte("-----BEGIN ")
 var armorEnd = []byte("-----END ")
 var armorEndOfLine = []byte("-----")
 
-// lineReader wraps a line based reader. It watches for the end of an armor block
+const crc24Mask = 0xffffff
+
+// lineReader wraps a line based reader. It watches for the end of an armor
+// block and records the expected CRC value.
 type lineReader struct {
-	in  *bufio.Reader
-	buf []byte
-	eof bool
+	in     *bufio.Reader
+	buf    []byte
+	eof    bool
+	crc    uint32
+	crcSet bool
 }
 
 func (l *lineReader) Read(p []byte) (n int, err error) {
@@ -64,6 +69,12 @@ func (l *lineReader) Read(p []byte) (n int, err error) {
 
 	line, isPrefix, err := l.in.ReadLine()
 	if err != nil {
+		if err == io.EOF {
+			// The underlying reader ended before the terminating
+			// -----END----- line of the block was seen, so the armor
+			// block is truncated and must not be treated as complete.
+			return 0, ArmorCorrupt
+		}
 		return
 	}
 	if isPrefix {
@@ -79,9 +90,26 @@ func (l *lineReader) Read(p []byte) (n int, err error) {
 
 	if len(line) == 5 && line[0] == '=' {
 		// This is the checksum line
-		// Don't check the checksum
+		var expectedBytes [3]byte
+		var m int
+		m, err = base64.StdEncoding.Decode(expectedBytes[0:], line[1:])
+		if m != 3 || err != nil {
+			return 0, ArmorCorrupt
+		}
+		l.crc = uint32(expectedBytes[0])<<16 |
+			uint32(expectedBytes[1])<<8 |
+			uint32(expectedBytes[2])
+
+		line, _, err = l.in.ReadLine()
+		if err != nil && err != io.EOF {
+			return
+		}
+		if !bytes.HasPrefix(bytes.TrimSpace(line), armorEnd) {
+			return 0, ArmorCorrupt
+		}
 
 		l.eof = true
+		l.crcSet = true
 		return 0, io.EOF
 	}
 
@@ -102,14 +130,23 @@ func (l *lineReader) Read(p []byte) (n int, err error) {
 	return
 }
 
-// openpgpReader passes Read calls to the underlying base64 decoder.
+// openpgpReader passes Read calls to the underlying base64 decoder, but keeps
+// a running CRC of the resulting data and checks the CRC against the value
+// found by the lineReader at EOF.
 type openpgpReader struct {
-	lReader   *lineReader
-	b64Reader io.Reader
+	lReader    *lineReader
+	b64Reader  io.Reader
+	currentCRC uint32
 }
 
 func (r *openpgpReader) Read(p []byte) (n int, err error) {
 	n, err = r.b64Reader.Read(p)
+	r.currentCRC = crc24(r.currentCRC, p[:n])
+
+	if err == io.EOF && r.lReader.crcSet && r.lReader.crc != uint32(r.currentCRC&crc24Mask) {
+		return 0, ArmorCorrupt
+	}
+
 	return
 }
 
@@ -177,6 +214,7 @@ TryNextBlock:
 	}
 
 	p.lReader.in = r
+	p.oReader.currentCRC = crc24Init
 	p.oReader.lReader = &p.lReader
 	p.oReader.b64Reader = base64.NewDecoder(base64.StdEncoding, &p.lReader)
 	p.Body = &p.oReader
