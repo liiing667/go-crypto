@@ -69,6 +69,12 @@ type Config struct {
 	// and password-encrypted data.
 	// If nil, the default configuration is used
 	S2KConfig *s2k.Config
+	// S2KUnlockBudget limits the work performed when decrypting private keys
+	// with a passphrase. S2K parameters are stored in the key packet and are
+	// therefore controlled by whoever created the key. The budget is checked
+	// before any expensive derivation starts.
+	// If nil, s2k.DefaultBudget is used.
+	S2KUnlockBudget *s2k.Budget
 	// Iteration count for Iterated S2K (String to Key).
 	// Only used if sk2.Mode is nil.
 	// This value is duplicated here from s2k.Config for backwards compatibility.
@@ -204,6 +210,16 @@ func (c *Config) Random() io.Reader {
 		return rand.Reader
 	}
 	return c.Rand
+}
+
+// UnlockBudget returns the configured S2K unlock budget, or the default budget
+// when no budget is configured.
+func (c *Config) UnlockBudget() *s2k.Budget {
+	if c == nil || c.S2KUnlockBudget == nil {
+		budget := s2k.DefaultUnlockBudget()
+		return &budget
+	}
+	return c.S2KUnlockBudget
 }
 
 func (c *Config) Hash() crypto.Hash {

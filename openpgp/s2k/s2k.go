@@ -8,6 +8,7 @@
 package s2k // import "github.com/ProtonMail/go-crypto/openpgp/s2k"
 
 import (
+	"context"
 	"crypto"
 	"hash"
 	"io"
@@ -117,13 +118,29 @@ func Simple(out []byte, h hash.Hash, in []byte) {
 
 var zero [1]byte
 
+// s2kContextCheckInterval bounds how long an iterated S2K derivation can run
+// without observing cancellation. Imported keys can request very large
+// iteration counts, so checking only once before the derivation is not enough.
+const s2kContextCheckInterval = 64 << 10
+
 // Salted writes to out the result of computing the Salted S2K function (RFC
 // 4880, section 3.7.1.2) using the given hash, input passphrase and salt.
 func Salted(out []byte, h hash.Hash, in []byte, salt []byte) {
+	_ = SaltedContext(context.Background(), out, h, in, salt)
+}
+
+// SaltedContext is like Salted but observes ctx between digest rounds.
+func SaltedContext(ctx context.Context, out []byte, h hash.Hash, in []byte, salt []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	done := 0
 	var digest []byte
 
 	for i := 0; done < len(out); i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		h.Reset()
 		for j := 0; j < i; j++ {
 			h.Write(zero[:])
@@ -134,12 +151,23 @@ func Salted(out []byte, h hash.Hash, in []byte, salt []byte) {
 		n := copy(out[done:], digest)
 		done += n
 	}
+	return ctx.Err()
 }
 
 // Iterated writes to out the result of computing the Iterated and Salted S2K
 // function (RFC 4880, section 3.7.1.3) using the given hash, input passphrase,
 // salt and iteration count.
 func Iterated(out []byte, h hash.Hash, in []byte, salt []byte, count int) {
+	_ = IteratedContext(context.Background(), out, h, in, salt, count)
+}
+
+// IteratedContext is like Iterated but observes ctx while hashing. The
+// iteration count is attacker-controlled when reading imported keys, so
+// cancellation is checked at regular intervals rather than only at the start.
+func IteratedContext(ctx context.Context, out []byte, h hash.Hash, in []byte, salt []byte, count int) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	combined := make([]byte, len(in)+len(salt))
 	copy(combined, salt)
 	copy(combined[len(salt):], in)
@@ -151,32 +179,56 @@ func Iterated(out []byte, h hash.Hash, in []byte, salt []byte, count int) {
 	done := 0
 	var digest []byte
 	for i := 0; done < len(out); i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		h.Reset()
 		for j := 0; j < i; j++ {
 			h.Write(zero[:])
 		}
 		written := 0
+		nextCheck := s2kContextCheckInterval
 		for written < count {
-			if written+len(combined) > count {
-				todo := count - written
-				h.Write(combined[:todo])
-				written = count
-			} else {
-				h.Write(combined)
-				written += len(combined)
+			if written >= nextCheck {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				nextCheck += s2kContextCheckInterval
 			}
+			todo := len(combined)
+			if count-written < todo {
+				todo = count - written
+			}
+			h.Write(combined[:todo])
+			written += todo
 		}
 		digest = h.Sum(digest[:0])
 		n := copy(out[done:], digest)
 		done += n
 	}
+	return ctx.Err()
 }
 
 // Argon2 writes to out the key derived from the password (in) with the Argon2
 // function (the crypto refresh, section 3.7.1.4)
 func Argon2(out []byte, in []byte, salt []byte, passes uint8, paralellism uint8, memoryExp uint8) {
+	_ = Argon2Context(context.Background(), out, in, salt, passes, paralellism, memoryExp)
+}
+
+// Argon2Context is like Argon2 but observes ctx before and after the call.
+// The Argon2 implementation itself does not support interruption, so callers
+// also need an S2K parameter budget to bound the memory and work it can
+// request.
+func Argon2Context(ctx context.Context, out []byte, in []byte, salt []byte, passes uint8, paralellism uint8, memoryExp uint8) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	key := argon2.IDKey(in, salt, uint32(passes), decodeMemory(memoryExp), paralellism, uint32(len(out)))
 	copy(out[:], key)
+	return ctx.Err()
 }
 
 // Generate generates valid parameters from given configuration.
@@ -365,6 +417,82 @@ func (params *Params) Function() (f func(out, in []byte), err error) {
 	}
 
 	return nil, errors.UnsupportedError("S2K function")
+}
+
+// FunctionWithContext is like Function, but the returned function observes ctx
+// while deriving the key.
+func (params *Params) FunctionWithContext(ctx context.Context) (func(out, in []byte) error, error) {
+	if params == nil {
+		return nil, errors.InvalidArgumentError("missing s2k parameters")
+	}
+	if params.Dummy() {
+		return nil, errors.ErrDummyPrivateKey("dummy key found")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := params.validateForDerivation(); err != nil {
+		return nil, err
+	}
+	return func(out, in []byte) error {
+		return params.Derive(ctx, out, in)
+	}, nil
+}
+
+// Derive computes the S2K transform described by params into out, observing
+// ctx. This is the context-aware equivalent of calling the function returned
+// by Function.
+func (params *Params) Derive(ctx context.Context, out, in []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if params == nil {
+		return errors.InvalidArgumentError("missing s2k parameters")
+	}
+	if params.Dummy() {
+		return errors.ErrDummyPrivateKey("dummy key found")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := params.validateForDerivation(); err != nil {
+		return err
+	}
+
+	switch params.mode {
+	case SimpleS2K:
+		hashObj, _ := algorithm.HashIdToHashWithSha1(params.hashId)
+		return SaltedContext(ctx, out, hashObj.New(), in, nil)
+	case SaltedS2K:
+		hashObj, _ := algorithm.HashIdToHashWithSha1(params.hashId)
+		return SaltedContext(ctx, out, hashObj.New(), in, params.salt())
+	case IteratedSaltedS2K:
+		hashObj, _ := algorithm.HashIdToHashWithSha1(params.hashId)
+		return IteratedContext(ctx, out, hashObj.New(), in, params.salt(), decodeCount(params.countByte))
+	case Argon2S2K:
+		// argon2.IDKey does not accept a context. Check cancellation
+		// immediately before and after the call; the parameter budget bounds
+		// how much memory the call can allocate.
+		return Argon2Context(ctx, out, in, params.salt(), params.passes, params.parallelism, params.memoryExp)
+	default:
+		return errors.UnsupportedError("S2K function")
+	}
+}
+
+// validateForDerivation mirrors the checks performed by Function without
+// constructing a hash instance.
+func (params *Params) validateForDerivation() error {
+	if params.mode == Argon2S2K {
+		return validateArgon2Params(params)
+	}
+	hashObj, ok := algorithm.HashIdToHashWithSha1(params.hashId)
+	if !ok {
+		return errors.UnsupportedError("hash for S2K function: " + strconv.Itoa(int(params.hashId)))
+	}
+	if !hashObj.Available() {
+		return errors.UnsupportedError("hash not available: " + strconv.Itoa(int(hashObj)))
+	}
+	return nil
 }
 
 func (params *Params) Serialize(w io.Writer) (err error) {

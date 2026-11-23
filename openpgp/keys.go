@@ -5,6 +5,7 @@
 package openpgp
 
 import (
+	"context"
 	goerrors "errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/go-crypto/openpgp/errors"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
+	"github.com/ProtonMail/go-crypto/openpgp/s2k"
 )
 
 // PublicKeyType is the armor type for a PGP public key.
@@ -286,6 +288,25 @@ func (e *Entity) EncryptPrivateKeys(passphrase []byte, config *packet.Config) er
 // Avoids recomputation of similar s2k key derivations. Public keys and dummy keys are ignored,
 // and don't cause an error to be returned.
 func (e *Entity) DecryptPrivateKeys(passphrase []byte) error {
+	return e.DecryptPrivateKeysWithContext(context.Background(), passphrase)
+}
+
+// DecryptPrivateKeysWithContext decrypts all encrypted keys in the entity with
+// the given passphrase while observing ctx.
+func (e *Entity) DecryptPrivateKeysWithContext(ctx context.Context, passphrase []byte) error {
+	return e.DecryptPrivateKeysWithConfig(ctx, passphrase, nil)
+}
+
+// DecryptPrivateKeysWithBudget decrypts all encrypted keys in the entity using
+// the given S2K unlock budget.
+func (e *Entity) DecryptPrivateKeysWithBudget(ctx context.Context, passphrase []byte, budget *s2k.Budget) error {
+	return e.DecryptPrivateKeysWithConfig(ctx, passphrase, &packet.Config{S2KUnlockBudget: budget})
+}
+
+// DecryptPrivateKeysWithConfig decrypts all encrypted keys in the entity with
+// the given passphrase. config may supply an S2K unlock budget. The batch is
+// transactional: a failure leaves every key encrypted.
+func (e *Entity) DecryptPrivateKeysWithConfig(ctx context.Context, passphrase []byte, config *packet.Config) error {
 	var keysToDecrypt []*packet.PrivateKey
 	// Add entity private key to decrypt.
 	if e.PrivateKey != nil && !e.PrivateKey.Dummy() && e.PrivateKey.Encrypted {
@@ -298,7 +319,26 @@ func (e *Entity) DecryptPrivateKeys(passphrase []byte) error {
 			keysToDecrypt = append(keysToDecrypt, sub.PrivateKey)
 		}
 	}
-	return packet.DecryptPrivateKeys(keysToDecrypt, passphrase)
+	return packet.DecryptPrivateKeysWithConfig(ctx, keysToDecrypt, passphrase, config)
+}
+
+// DecryptPrivateKeysWithCache is like DecryptPrivateKeysWithConfig, but uses
+// cache for the unlock transaction so a caller can observe its generation and
+// entries after a failure.
+func (e *Entity) DecryptPrivateKeysWithCache(ctx context.Context, passphrase []byte, cache *s2k.Cache) error {
+	var keysToDecrypt []*packet.PrivateKey
+	// Add entity private key to decrypt.
+	if e.PrivateKey != nil && !e.PrivateKey.Dummy() && e.PrivateKey.Encrypted {
+		keysToDecrypt = append(keysToDecrypt, e.PrivateKey)
+	}
+
+	// Add subkeys to decrypt.
+	for _, sub := range e.Subkeys {
+		if sub.PrivateKey != nil && !sub.PrivateKey.Dummy() && sub.PrivateKey.Encrypted {
+			keysToDecrypt = append(keysToDecrypt, sub.PrivateKey)
+		}
+	}
+	return packet.DecryptPrivateKeysWithCache(ctx, keysToDecrypt, passphrase, cache)
 }
 
 // Revoked returns whether the identity has been revoked by a self-signature.

@@ -20,6 +20,11 @@ var (
 	ErrMDCHashMismatch error = SignatureError("MDC hash mismatch")
 	// ErrMDCMissing
 	ErrMDCMissing error = SignatureError("MDC packet not found")
+	// ErrS2KBudgetExceeded is returned when an S2K parameter set asks for
+	// more hashing work or memory than the caller's unlock budget allows.
+	// S2K parameters are attacker-controlled in imported keys, so this check
+	// happens before any expensive derivation starts.
+	ErrS2KBudgetExceeded error = s2kBudgetError(0)
 )
 
 // A StructuralError is returned when OpenPGP data is found to be syntactically
@@ -189,6 +194,12 @@ func (e messageTooLargeError) Error() string {
 // ErrMessageTooLarge is returned if the read data from
 // a compressed packet exceeds the provided limit.
 var ErrMessageTooLarge error = messageTooLargeError(0)
+
+type s2kBudgetError int
+
+func (s2kBudgetError) Error() string {
+	return "openpgp: s2k parameter budget exceeded"
+}
 
 // ErrEncryptionKeySelection is returned if encryption key selection fails (v2 API).
 type ErrEncryptionKeySelection struct {

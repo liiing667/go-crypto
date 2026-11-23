@@ -654,57 +654,6 @@ func (pk *PrivateKey) decrypt(decryptionKey []byte) error {
 	return nil
 }
 
-func (pk *PrivateKey) decryptWithCache(passphrase []byte, keyCache *s2k.Cache) error {
-	if pk.Dummy() {
-		return errors.ErrDummyPrivateKey("dummy key found")
-	}
-	if !pk.Encrypted {
-		return nil
-	}
-
-	key, err := keyCache.GetOrComputeDerivedKey(passphrase, pk.s2kParams, pk.cipher.KeySize())
-	if err != nil {
-		return err
-	}
-	if pk.s2kType == S2KAEAD {
-		key = pk.applyHKDF(key)
-	}
-	return pk.decrypt(key)
-}
-
-// Decrypt decrypts an encrypted private key using a passphrase.
-func (pk *PrivateKey) Decrypt(passphrase []byte) error {
-	if pk.Dummy() {
-		return errors.ErrDummyPrivateKey("dummy key found")
-	}
-	if !pk.Encrypted {
-		return nil
-	}
-
-	key := make([]byte, pk.cipher.KeySize())
-	pk.s2k(key, passphrase)
-	if pk.s2kType == S2KAEAD {
-		key = pk.applyHKDF(key)
-	}
-	return pk.decrypt(key)
-}
-
-// DecryptPrivateKeys decrypts all encrypted keys with the given config and passphrase.
-// Avoids recomputation of similar s2k key derivations.
-func DecryptPrivateKeys(keys []*PrivateKey, passphrase []byte) error {
-	// Create a cache to avoid recomputation of key derviations for the same passphrase.
-	s2kCache := &s2k.Cache{}
-	for _, key := range keys {
-		if key != nil && !key.Dummy() && key.Encrypted {
-			err := key.decryptWithCache(passphrase, s2kCache)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 // encrypt encrypts an unencrypted private key.
 func (pk *PrivateKey) encrypt(key []byte, params *s2k.Params, s2kType S2KType, cipherFunction CipherFunction, rand io.Reader) error {
 	if pk.Dummy() {
