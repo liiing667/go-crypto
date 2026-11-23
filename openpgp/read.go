@@ -6,6 +6,7 @@
 package openpgp // import "github.com/ProtonMail/go-crypto/openpgp"
 
 import (
+	"bytes"
 	"crypto"
 	_ "crypto/sha256"
 	_ "crypto/sha512"
@@ -468,6 +469,26 @@ func VerifyDetachedSignatureAndHash(keyring KeyRing, signed, signature io.Reader
 	return verifyDetachedSignature(keyring, signed, signature, expectedHashes, true, config)
 }
 
+// VerifyDetachedSignaturePacket verifies a single parsed signature packet
+// against signed. It is intended for callers that need to verify each
+// signature of a multi-signature message independently. The caller must pass
+// the complete signed data for every invocation, and must not reuse a consumed
+// signed reader between invocations.
+func VerifyDetachedSignaturePacket(keyring KeyRing, signed io.Reader, sig *packet.Signature, config *packet.Config) (signer *Entity, err error) {
+	if sig == nil {
+		return nil, errors.InvalidArgumentError("nil signature packet")
+	}
+	if sig.IssuerKeyId == nil {
+		return nil, errors.StructuralError("signature doesn't have an issuer")
+	}
+	if keyring == nil {
+		return nil, errors.ErrUnknownIssuer
+	}
+
+	keys := keyring.KeysByIdUsage(*sig.IssuerKeyId, packet.KeyFlagSign)
+	return verifyDetachedSignatureWithKeys(keys, signed, sig, config)
+}
+
 // CheckDetachedSignature takes a signed file and a detached signature and
 // returns the entity the signature was signed by, if any, and a possible
 // signature verification error. If the signer isn't known,
@@ -485,9 +506,6 @@ func CheckDetachedSignatureAndHash(keyring KeyRing, signed, signature io.Reader,
 }
 
 func verifyDetachedSignature(keyring KeyRing, signed, signature io.Reader, expectedHashes []crypto.Hash, checkHashes bool, config *packet.Config) (sig *packet.Signature, signer *Entity, err error) {
-	var issuerKeyId uint64
-	var hashFunc crypto.Hash
-	var sigType packet.SignatureType
 	var keys []Key
 	var p packet.Packet
 
@@ -509,14 +527,11 @@ func verifyDetachedSignature(keyring KeyRing, signed, signature io.Reader, expec
 		if sig.IssuerKeyId == nil {
 			return nil, nil, errors.StructuralError("signature doesn't have an issuer")
 		}
-		issuerKeyId = *sig.IssuerKeyId
-		hashFunc = sig.Hash
-		sigType = sig.SigType
 		if checkHashes {
 			matchFound := false
 			// check for hashes
 			for _, expectedHash := range expectedHashes {
-				if hashFunc == expectedHash {
+				if sig.Hash == expectedHash {
 					matchFound = true
 					break
 				}
@@ -525,7 +540,7 @@ func verifyDetachedSignature(keyring KeyRing, signed, signature io.Reader, expec
 				return nil, nil, errors.StructuralError("hash algorithm or salt mismatch with cleartext message headers")
 			}
 		}
-		keys = keyring.KeysByIdUsage(issuerKeyId, packet.KeyFlagSign)
+		keys = keyring.KeysByIdUsage(*sig.IssuerKeyId, packet.KeyFlagSign)
 		if len(keys) > 0 {
 			break
 		}
@@ -535,27 +550,61 @@ func verifyDetachedSignature(keyring KeyRing, signed, signature io.Reader, expec
 		panic("unreachable")
 	}
 
-	h, err := sig.PrepareVerify()
-	if err != nil {
+	signer, err = verifyDetachedSignatureWithKeys(keys, signed, sig, config)
+	if signer == nil {
 		return nil, nil, err
 	}
-	wrappedHash, err := wrapHashForSignature(h, sigType)
-	if err != nil {
-		return nil, nil, err
+	return sig, signer, err
+}
+
+// verifyDetachedSignatureWithKeys verifies sig against signed using one of
+// keys. A fresh hash state is used for every key because VerifySignature
+// appends the signature's hash suffix to the hash that it is given.
+func verifyDetachedSignatureWithKeys(keys []Key, signed io.Reader, sig *packet.Signature, config *packet.Config) (signer *Entity, err error) {
+	if len(keys) == 0 {
+		return nil, errors.ErrUnknownIssuer
 	}
 
-	if _, err := io.Copy(wrappedHash, signed); err != nil && err != io.EOF {
-		return nil, nil, err
-	}
-
-	for _, key := range keys {
-		err = key.PublicKey.VerifySignature(h, sig)
-		if err == nil {
-			return sig, key.Entity, checkMessageSignatureDetails(&key, sig, config)
+	// When more than one key has the issuer key ID, the signed data has to be
+	// replayed for each candidate key. Buffer it once instead of requiring a
+	// seekable reader or hashing it once and corrupting the hash state.
+	var signedBytes []byte
+	if len(keys) > 1 {
+		signedBytes, err = io.ReadAll(signed)
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	return nil, nil, err
+	var lastErr error
+	for _, key := range keys {
+		h, err := sig.PrepareVerify()
+		if err != nil {
+			return nil, err
+		}
+		wrappedHash, err := wrapHashForSignature(h, sig.SigType)
+		if err != nil {
+			return nil, err
+		}
+
+		var signedData io.Reader
+		if len(keys) > 1 {
+			signedData = bytes.NewReader(signedBytes)
+		} else {
+			signedData = signed
+		}
+		if _, err := io.Copy(wrappedHash, signedData); err != nil {
+			return nil, err
+		}
+
+		err = key.PublicKey.VerifySignature(h, sig)
+		if err == nil {
+			return key.Entity, checkMessageSignatureDetails(&key, sig, config)
+		}
+		lastErr = err
+	}
+
+	return nil, lastErr
 }
 
 // CheckArmoredDetachedSignature performs the same actions as

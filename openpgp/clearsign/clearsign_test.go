@@ -295,6 +295,282 @@ func TestMultiSignV6(t *testing.T) {
 	testMultiSign(t, true)
 }
 
+func makeClearSignTestEntity(t *testing.T, name string, v6 bool) *openpgp.Entity {
+	t.Helper()
+
+	algorithm := packet.PubKeyAlgoEdDSA
+	if v6 {
+		// The legacy EdDSA algorithm cannot be used for v6 keys.
+		algorithm = packet.PubKeyAlgoEd25519
+	}
+	entity, err := openpgp.NewEntity(name, "clearsign test", name+"@example.com", &packet.Config{
+		Algorithm: algorithm,
+		V6Keys:    v6,
+	})
+	if err != nil {
+		t.Fatalf("cannot create key: %v", err)
+	}
+	return entity
+}
+
+func makeClearSignTestMessage(t *testing.T, message string, privateKeys ...*packet.PrivateKey) []byte {
+	t.Helper()
+
+	var output bytes.Buffer
+	w, err := EncodeMulti(&output, privateKeys, &packet.Config{})
+	if err != nil {
+		t.Fatalf("EncodeMulti failed: %v", err)
+	}
+	if _, err := w.Write([]byte(message)); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	return output.Bytes()
+}
+
+type clearSignTestKeyRing []openpgp.Key
+
+func (r clearSignTestKeyRing) KeysById(uint64) []openpgp.Key {
+	return r
+}
+
+func (r clearSignTestKeyRing) KeysByIdUsage(uint64, byte) []openpgp.Key {
+	return r
+}
+
+func (r clearSignTestKeyRing) DecryptionKeys() []openpgp.Key {
+	return nil
+}
+
+func TestClearSignVerifyRetryWithMultipleSignatures(t *testing.T) {
+	for _, v6 := range []bool{false, true} {
+		name := "v4"
+		if v6 {
+			name = "v6"
+		}
+		t.Run(name, func(t *testing.T) {
+			first := makeClearSignTestEntity(t, "first-"+name, v6)
+			second := makeClearSignTestEntity(t, "second-"+name, v6)
+			message := "first line\nsecond line"
+			signed := makeClearSignTestMessage(t, message, first.PrivateKey, second.PrivateKey)
+
+			block, _ := Decode(signed)
+			if block == nil {
+				t.Fatal("failed to decode clearsigned message")
+			}
+			if string(block.Plaintext) != message {
+				t.Fatalf("unexpected plaintext: %q", block.Plaintext)
+			}
+			signatures, err := block.SignaturePackets()
+			if err != nil {
+				t.Fatalf("cannot parse signature packets: %v", err)
+			}
+			if len(signatures) != 2 {
+				t.Fatalf("got %d signatures, want 2", len(signatures))
+			}
+
+			// The same block must be verifiable repeatedly. In particular,
+			// selecting the second signature must not consume or reorder the
+			// first one.
+			signer, err := block.VerifySignature(openpgp.EntityList{first}, nil)
+			if err != nil {
+				t.Fatalf("cannot verify first signature: %v", err)
+			}
+			if signer != first {
+				t.Fatal("first verification returned the wrong signer")
+			}
+			signer, err = block.VerifySignature(openpgp.EntityList{second}, nil)
+			if err != nil {
+				t.Fatalf("cannot retry with second signature: %v", err)
+			}
+			if signer != second {
+				t.Fatal("retry returned the wrong signer")
+			}
+			if string(block.Plaintext) != message {
+				t.Fatalf("retry changed the plaintext: %q", block.Plaintext)
+			}
+
+			signers, err := block.VerifySignatures(openpgp.EntityList{first, second}, nil)
+			if err != nil {
+				t.Fatalf("cannot verify all signatures: %v", err)
+			}
+			if len(signers) != 2 || signers[0] != first || signers[1] != second {
+				t.Fatalf("unexpected signer set: %v", signers)
+			}
+		})
+	}
+}
+
+func TestClearSignVerifyTriesMultipleKeys(t *testing.T) {
+	signer := makeClearSignTestEntity(t, "multiple-keys-signer", false)
+	other := makeClearSignTestEntity(t, "multiple-keys-other", false)
+	signed := makeClearSignTestMessage(t, "multiple key body", signer.PrivateKey)
+	block, _ := Decode(signed)
+	if block == nil {
+		t.Fatal("failed to decode clearsigned message")
+	}
+
+	signerEntities := openpgp.EntityList{signer}
+	otherEntities := openpgp.EntityList{other}
+	signerKey := signerEntities.KeysById(signer.PrimaryKey.KeyId)[0]
+	otherKey := otherEntities.KeysById(other.PrimaryKey.KeyId)[0]
+	keyring := clearSignTestKeyRing{otherKey, signerKey}
+
+	verified, err := block.VerifySignature(keyring, nil)
+	if err != nil {
+		t.Fatalf("cannot verify signature with multiple candidate keys: %v", err)
+	}
+	if verified != signer {
+		t.Fatal("verification returned the wrong entity")
+	}
+}
+
+func TestClearSignVerifyMixedKeyVersions(t *testing.T) {
+	v4 := makeClearSignTestEntity(t, "mixed-v4", false)
+	v6 := makeClearSignTestEntity(t, "mixed-v6", true)
+	message := "mixed v4 and v6 body"
+	signed := makeClearSignTestMessage(t, message, v4.PrivateKey, v6.PrivateKey)
+	block, _ := Decode(signed)
+	if block == nil {
+		t.Fatal("failed to decode clearsigned message")
+	}
+	if string(block.Plaintext) != message {
+		t.Fatalf("unexpected plaintext: %q", block.Plaintext)
+	}
+
+	signers, err := block.VerifySignatures(openpgp.EntityList{v4, v6}, nil)
+	if err != nil {
+		t.Fatalf("cannot verify mixed v4/v6 signatures: %v", err)
+	}
+	if len(signers) != 2 || signers[0] != v4 || signers[1] != v6 {
+		t.Fatalf("unexpected mixed signer set: %v", signers)
+	}
+}
+
+func TestClearSignVerifyDoesNotCrossBlocks(t *testing.T) {
+	first := makeClearSignTestEntity(t, "block-first", false)
+	second := makeClearSignTestEntity(t, "block-second", false)
+	firstMessage := "first block body"
+	secondMessage := "second block body"
+	firstBlock := makeClearSignTestMessage(t, firstMessage, first.PrivateKey)
+	secondBlock := makeClearSignTestMessage(t, secondMessage, second.PrivateKey)
+
+	signed := append(append([]byte{}, firstBlock...), secondBlock...)
+	decodedFirst, rest := Decode(signed)
+	if decodedFirst == nil {
+		t.Fatal("failed to decode first block")
+	}
+	decodedSecond, _ := Decode(rest)
+	if decodedSecond == nil {
+		t.Fatal("failed to decode second block")
+	}
+
+	// A key that only signs the second block must not verify the first
+	// block's body, even when the two blocks are adjacent.
+	if signer, err := decodedFirst.VerifySignature(openpgp.EntityList{second}, nil); err == nil || signer != nil {
+		t.Fatalf("first block verified with second block signer: %v", signer)
+	}
+	if signers, err := decodedFirst.VerifySignatures(openpgp.EntityList{second}, nil); err == nil || len(signers) != 0 {
+		t.Fatalf("first block returned second block signers: %v", signers)
+	}
+	if string(decodedFirst.Plaintext) != firstMessage {
+		t.Fatalf("first block body changed: %q", decodedFirst.Plaintext)
+	}
+
+	signer, err := decodedSecond.VerifySignature(openpgp.EntityList{second}, nil)
+	if err != nil {
+		t.Fatalf("cannot verify second block: %v", err)
+	}
+	if signer != second || string(decodedSecond.Plaintext) != secondMessage {
+		t.Fatal("second block returned the wrong signer or body")
+	}
+	if signer, err := decodedSecond.VerifySignature(openpgp.EntityList{first}, nil); err == nil || signer != nil {
+		t.Fatalf("second block verified with first block signer: %v", signer)
+	}
+}
+
+func TestClearSignVerifyRejectsForeignSignatureBlock(t *testing.T) {
+	first := makeClearSignTestEntity(t, "foreign-first", false)
+	second := makeClearSignTestEntity(t, "foreign-second", false)
+	firstMessage := "body signed by first"
+	secondMessage := "body signed by second"
+	firstBlock := makeClearSignTestMessage(t, firstMessage, first.PrivateKey)
+	secondBlock := makeClearSignTestMessage(t, secondMessage, second.PrivateKey)
+
+	firstSignature := bytes.Index(firstBlock, endText)
+	secondSignature := bytes.Index(secondBlock, endText)
+	if firstSignature < 0 || secondSignature < 0 {
+		t.Fatal("signed messages do not contain signature blocks")
+	}
+
+	// Replace the first block's signature with the second block's signature.
+	// The second signature is valid, but only for the second body, so it must
+	// not be attributed to the first block.
+	forged := append(append([]byte{}, firstBlock[:firstSignature]...), secondBlock[secondSignature:]...)
+	block, _ := Decode(forged)
+	if block == nil {
+		t.Fatal("failed to decode forged message")
+	}
+	if string(block.Plaintext) != firstMessage {
+		t.Fatalf("unexpected forged plaintext: %q", block.Plaintext)
+	}
+	if signer, err := block.VerifySignature(openpgp.EntityList{second}, nil); err == nil || signer != nil {
+		t.Fatalf("foreign signature verified: %v", signer)
+	}
+	if signers, err := block.VerifySignatures(openpgp.EntityList{first, second}, nil); err == nil || len(signers) != 0 {
+		t.Fatalf("foreign signature contributed signers: %v", signers)
+	}
+}
+
+func TestClearSignVerifyChecksHashHeader(t *testing.T) {
+	entity := makeClearSignTestEntity(t, "hash-header", false)
+	message := "hash header body"
+	signed := makeClearSignTestMessage(t, message, entity.PrivateKey)
+	keyring := openpgp.EntityList{entity}
+
+	t.Run("matching additional hash", func(t *testing.T) {
+		modified := bytes.Replace(signed, []byte("Hash: SHA256"), []byte("Hash: SHA512,SHA256"), 1)
+		block, _ := Decode(modified)
+		if block == nil {
+			t.Fatal("failed to decode message")
+		}
+		if _, err := block.VerifySignature(keyring, nil); err != nil {
+			t.Fatalf("matching hash header failed verification: %v", err)
+		}
+	})
+
+	t.Run("mismatching hash", func(t *testing.T) {
+		modified := bytes.Replace(signed, []byte("Hash: SHA256"), []byte("Hash: SHA512"), 1)
+		block, _ := Decode(modified)
+		if block == nil {
+			t.Fatal("failed to decode message")
+		}
+		if signer, err := block.VerifySignature(keyring, nil); err == nil || signer != nil {
+			t.Fatalf("mismatching hash header verified: %v", signer)
+		}
+		results, err := block.VerifySignatureResults(keyring, nil)
+		if err != nil {
+			t.Fatalf("unexpected decode error: %v", err)
+		}
+		if len(results) != 1 || results[0].Err == nil || results[0].Signer != nil {
+			t.Fatalf("unexpected per-signature result: %+v", results)
+		}
+	})
+
+	t.Run("missing hash header for legacy message", func(t *testing.T) {
+		modified := bytes.Replace(signed, []byte("Hash: SHA256\n"), nil, 1)
+		block, _ := Decode(modified)
+		if block == nil {
+			t.Fatal("failed to decode message")
+		}
+		if _, err := block.VerifySignature(keyring, nil); err != nil {
+			t.Fatalf("legacy message without hash header failed verification: %v", err)
+		}
+	})
+}
+
 func TestDecodeMissingCRC(t *testing.T) {
 	block, rest := Decode(clearsignInput3)
 	if block == nil {

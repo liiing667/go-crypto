@@ -27,8 +27,8 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 )
 
-// A Block represents a clearsigned message. A signature on a Block can
-// be checked by calling Block.VerifySignature.
+// A Block represents a clearsigned message. Signatures on a Block can be
+// checked by calling Block.VerifySignature or Block.VerifySignatures.
 type Block struct {
 	Headers          textproto.MIMEHeader // Optional unverified Hash headers
 	Plaintext        []byte               // The original message text
@@ -81,8 +81,9 @@ func getLine(data []byte) (line, rest []byte) {
 // discarded.
 //
 // If no message is found, or if the message is invalid, Decode returns nil and
-// the whole data slice. The only allowed header type is Hash, and it is not
-// verified against the signature hash.
+// the whole data slice. The only allowed header type is Hash. Decode does not
+// verify the headers against the signatures; callers should use VerifySignature
+// or VerifySignatures for that.
 func Decode(data []byte) (b *Block, rest []byte) {
 	// start begins with a newline. However, at the very beginning of
 	// the byte array, we'll accept the start string without it.
@@ -201,6 +202,15 @@ func Decode(data []byte) (b *Block, rest []byte) {
 	if err != nil {
 		return nil, data
 	}
+
+	// Snapshot the armor body so that verification can be retried with
+	// different keyrings. The reader is replaced rather than merely cached so
+	// that callers that inspect ArmoredSignature.Body keep the old behavior.
+	signatureData, err := io.ReadAll(b.ArmoredSignature.Body)
+	if err != nil {
+		return nil, data
+	}
+	b.ArmoredSignature.Body = bytes.NewReader(signatureData)
 
 	return b, rest
 }
@@ -473,11 +483,206 @@ func EncodeMultiWithHeader(w io.Writer, privateKeys []*packet.PrivateKey, config
 	return
 }
 
+// SignatureVerification contains the result of verifying one signature packet
+// from a clearsigned message.
+type SignatureVerification struct {
+	Signature *packet.Signature
+	Signer    *openpgp.Entity
+	Err       error
+}
+
+// SignaturePackets returns all signature packets belonging to b. The packets
+// are parsed from the block's own armored signature body and do not consume
+// ArmoredSignature.Body.
+func (b *Block) SignaturePackets() ([]*packet.Signature, error) {
+	signatureData, err := b.armoredSignatureData()
+	if err != nil {
+		return nil, err
+	}
+	return parseSignaturePackets(signatureData)
+}
+
+func (b *Block) armoredSignatureData() ([]byte, error) {
+	if b == nil {
+		return nil, errors.InvalidArgumentError("nil clearsigned block")
+	}
+	if b.ArmoredSignature == nil || b.ArmoredSignature.Body == nil {
+		return nil, errors.StructuralError("clearsigned block has no armored signature")
+	}
+
+	if seeker, ok := b.ArmoredSignature.Body.(io.Seeker); ok {
+		position, err := seeker.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		signatureData, readErr := io.ReadAll(b.ArmoredSignature.Body)
+		if _, err := seeker.Seek(position, io.SeekStart); err != nil && readErr == nil {
+			readErr = err
+		}
+		return signatureData, readErr
+	}
+
+	signatureData, err := io.ReadAll(b.ArmoredSignature.Body)
+	if err != nil {
+		return nil, err
+	}
+	b.ArmoredSignature.Body = bytes.NewReader(signatureData)
+	return signatureData, nil
+}
+
+func parseSignaturePackets(signatureData []byte) ([]*packet.Signature, error) {
+	packets := packet.NewReader(bytes.NewReader(signatureData))
+	var signatures []*packet.Signature
+	for {
+		p, err := packets.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		sig, ok := p.(*packet.Signature)
+		if !ok {
+			return nil, errors.StructuralError("non signature packet found")
+		}
+		signatures = append(signatures, sig)
+	}
+	if len(signatures) == 0 {
+		return nil, errors.StructuralError("no signature packet found")
+	}
+	return signatures, nil
+}
+
+func (b *Block) expectedHashes() ([]crypto.Hash, error) {
+	var expected []crypto.Hash
+	seen := make(map[crypto.Hash]bool)
+	for key, values := range b.Headers {
+		if !strings.EqualFold(key, hashHeader) {
+			return nil, errors.StructuralError(`expected cleartext message header "Hash", got "` + key + `"`)
+		}
+		for _, value := range values {
+			for _, name := range strings.Split(value, ",") {
+				name = strings.ToUpper(strings.TrimSpace(name))
+				hashFunc := nameToHash(name)
+				if name == "" || hashFunc == 0 {
+					return nil, errors.StructuralError("unknown hash algorithm in cleartext message headers")
+				}
+				if !seen[hashFunc] {
+					seen[hashFunc] = true
+					expected = append(expected, hashFunc)
+				}
+			}
+		}
+	}
+	return expected, nil
+}
+
+func checkSignatureHashHeader(sig *packet.Signature, expectedHashes []crypto.Hash) error {
+	if len(expectedHashes) == 0 {
+		// RFC 9580 omits the Hash header for v6 signatures. Older messages may
+		// also omit it, so absence is accepted for compatibility.
+		return nil
+	}
+	if !slices.Contains(expectedHashes, sig.Hash) {
+		return errors.StructuralError("hash algorithm mismatch with cleartext message headers")
+	}
+	return nil
+}
+
+// VerifySignatureResults verifies every signature packet in b against the
+// block's body and Hash headers. Results are returned in packet order. A
+// failed signature has a non-nil Err. Signer is set only when the cryptographic
+// signature verified; it may be accompanied by an Err from the later key and
+// signature policy checks. An error is returned only if the block itself cannot
+// be decoded.
+func (b *Block) VerifySignatureResults(keyring openpgp.KeyRing, config *packet.Config) ([]SignatureVerification, error) {
+	signatures, err := b.SignaturePackets()
+	if err != nil {
+		return nil, err
+	}
+	expectedHashes, err := b.expectedHashes()
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]SignatureVerification, 0, len(signatures))
+	for _, sig := range signatures {
+		result := SignatureVerification{Signature: sig}
+		if err := checkSignatureHashHeader(sig, expectedHashes); err != nil {
+			result.Err = err
+			results = append(results, result)
+			continue
+		}
+		result.Signer, result.Err = openpgp.VerifyDetachedSignaturePacket(
+			keyring,
+			bytes.NewReader(b.Bytes),
+			sig,
+			config,
+		)
+		results = append(results, result)
+	}
+	return results, nil
+}
+
+// VerifySignatures verifies all signatures belonging to b and returns the
+// distinct entities whose signatures verified successfully. It returns nil and
+// an error if no signature verifies. Each signature's individual result can be
+// inspected with VerifySignatureResults.
+func (b *Block) VerifySignatures(keyring openpgp.KeyRing, config *packet.Config) ([]*openpgp.Entity, error) {
+	results, err := b.VerifySignatureResults(keyring, config)
+	if err != nil {
+		return nil, err
+	}
+
+	var signers []*openpgp.Entity
+	seen := make(map[*openpgp.Entity]bool)
+	var lastErr error
+	for _, result := range results {
+		if result.Err != nil {
+			lastErr = result.Err
+			continue
+		}
+		if result.Signer == nil || seen[result.Signer] {
+			continue
+		}
+		seen[result.Signer] = true
+		signers = append(signers, result.Signer)
+	}
+	if len(signers) == 0 {
+		if lastErr == nil {
+			lastErr = errors.ErrUnknownIssuer
+		}
+		return nil, lastErr
+	}
+	return signers, nil
+}
+
 // VerifySignature checks a clearsigned message signature, and checks that the
 // hash algorithm in the header matches the hash algorithm in the signature.
+// If the block contains multiple signatures, the first signature that verifies
+// successfully is used. Verification can be retried with another keyring.
 func (b *Block) VerifySignature(keyring openpgp.KeyRing, config *packet.Config) (signer *openpgp.Entity, err error) {
-	_, signer, err = openpgp.VerifyDetachedSignature(keyring, bytes.NewBuffer(b.Bytes), b.ArmoredSignature.Body, config)
-	return
+	results, err := b.VerifySignatureResults(keyring, config)
+	if err != nil {
+		return nil, err
+	}
+
+	var lastErr error
+	for _, result := range results {
+		if result.Signer != nil {
+			return result.Signer, result.Err
+		}
+		if result.Err != nil {
+			lastErr = result.Err
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.ErrUnknownIssuer
 }
 
 // writeHashHeader writes the legacy cleartext hash header to buffered.
@@ -532,6 +737,32 @@ func nameOfHash(h crypto.Hash) string {
 		return "SHA3-512"
 	}
 	return ""
+}
+
+// nameToHash returns a hash for a given OpenPGP name, or 0 if the name isn't
+// known. See RFC 4880, section 9.4.
+func nameToHash(name string) crypto.Hash {
+	switch strings.ToUpper(name) {
+	case "MD5":
+		return crypto.MD5
+	case "SHA1":
+		return crypto.SHA1
+	case "RIPEMD160":
+		return crypto.RIPEMD160
+	case "SHA224":
+		return crypto.SHA224
+	case "SHA256":
+		return crypto.SHA256
+	case "SHA384":
+		return crypto.SHA384
+	case "SHA512":
+		return crypto.SHA512
+	case "SHA3-256":
+		return crypto.SHA3_256
+	case "SHA3-512":
+		return crypto.SHA3_512
+	}
+	return crypto.Hash(0)
 }
 
 func acceptableHashesToWrite(singingKey *packet.PublicKey) []crypto.Hash {
