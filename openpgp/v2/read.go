@@ -502,6 +502,15 @@ func (cr *checkReader) Read(buf []byte) (int, error) {
 		return n, io.EOF
 	}
 	if sensitiveParsingError != nil {
+		// Finalize the decryption transaction on any failure so that a broken
+		// stream cannot leave an unclosed (and apparently successful)
+		// authenticator. Close is idempotent; its integrity error, if any,
+		// takes precedence.
+		if cr.md.decrypted != nil {
+			if closeErr := cr.md.decrypted.Close(); closeErr != nil {
+				return n, errors.HandleSensitiveParsingError(closeErr, true)
+			}
+		}
 		return n, errors.HandleSensitiveParsingError(sensitiveParsingError, true)
 	}
 	return n, nil
@@ -652,6 +661,15 @@ func (scr *signatureCheckReader) Read(buf []byte) (int, error) {
 	}
 
 	if sensitiveParsingError != nil {
+		// Finalize the decryption transaction on any failure so a truncated or
+		// corrupted stream can never produce an unverified signature or a
+		// silent success. Close is idempotent; its integrity error, if any,
+		// takes precedence.
+		if scr.md.decrypted != nil {
+			if closeErr := scr.md.decrypted.Close(); closeErr != nil {
+				return n, errors.HandleSensitiveParsingError(closeErr, true)
+			}
+		}
 		return n, errors.HandleSensitiveParsingError(sensitiveParsingError, readsDecryptedData)
 	}
 
