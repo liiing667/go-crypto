@@ -247,63 +247,85 @@ func (e *Entity) SigningKeyById(now time.Time, id uint64, config *packet.Config)
 }
 
 func (e *Entity) signingKeyByIdUsage(now time.Time, id uint64, flags int, config *packet.Config) (Key, error) {
-	primarySelfSignature, err := e.VerifyPrimaryKey(now, config)
+	keys, err := e.signingKeysByIdUsage(now, id, flags, nil, config)
 	if err != nil {
 		return Key{}, err
+	}
+	return keys[0], nil
+}
+
+// signingKeysByIdUsage returns every signing key in the entity that satisfies
+// the issuer, usage, validity and optional fingerprint constraints. The
+// historical "newest subkey first" preference is preserved in the result
+// order, but verification may try the remaining keys when more than one key
+// has the same key id.
+func (e *Entity) signingKeysByIdUsage(now time.Time, id uint64, flags int, fingerprint []byte, config *packet.Config) ([]Key, error) {
+	primarySelfSignature, err := e.VerifyPrimaryKey(now, config)
+	if err != nil {
+		return nil, err
 	}
 
 	if err = checkKeyRequirements(e.PrimaryKey, config); err != nil {
 		// The primary key produces weak signatures
-		return Key{}, err
+		return nil, err
 	}
 
-	// Iterate the keys to find the newest, unexpired one.
-	candidateSubkey := -1
+	// Iterate the keys to find all matching, unexpired subkeys.
+	var candidates []Key
+	bestSubkey := -1
 	var maxTime time.Time
-	var selectedSubkeySelfSig *packet.Signature
-	for idx, subkey := range e.Subkeys {
+	for idx := range e.Subkeys {
+		subkey := &e.Subkeys[idx]
 		subkeySelfSig, err := subkey.Verify(now, config)
 		if err == nil &&
 			(flags&packet.KeyFlagCertify == 0 || isValidCertificationKey(subkeySelfSig, subkey.PublicKey.PubKeyAlgo, config)) &&
 			(flags&packet.KeyFlagSign == 0 || isValidSigningKey(subkeySelfSig, subkey.PublicKey.PubKeyAlgo, config)) &&
 			checkKeyRequirements(subkey.PublicKey, config) == nil &&
-			(maxTime.IsZero() ||
+			(id == 0 || subkey.PublicKey.KeyId == id) &&
+			fingerprintMatches(subkey.PublicKey.Fingerprint, fingerprint) {
+			candidates = append(candidates, Key{
+				Entity:               subkey.Primary,
+				PrimarySelfSignature: primarySelfSignature,
+				PublicKey:            subkey.PublicKey,
+				PrivateKey:           subkey.PrivateKey,
+				SelfSignature:        subkeySelfSig,
+			})
+			if maxTime.IsZero() ||
 				subkeySelfSig.CreationTime.After(maxTime) ||
-				(subkeySelfSig.CreationTime.Equal(maxTime) && subkey.IsPQ())) &&
-			(id == 0 || subkey.PublicKey.KeyId == id) {
-			candidateSubkey = idx
-			maxTime = subkeySelfSig.CreationTime
-			selectedSubkeySelfSig = subkeySelfSig
+				(subkeySelfSig.CreationTime.Equal(maxTime) && subkey.IsPQ()) {
+				bestSubkey = len(candidates) - 1
+				maxTime = subkeySelfSig.CreationTime
+			}
 		}
 	}
 
-	if candidateSubkey != -1 {
-		subkey := &e.Subkeys[candidateSubkey]
-		return Key{
-			Entity:               subkey.Primary,
-			PrimarySelfSignature: primarySelfSignature,
-			PublicKey:            subkey.PublicKey,
-			PrivateKey:           subkey.PrivateKey,
-			SelfSignature:        selectedSubkeySelfSig,
-		}, nil
+	if bestSubkey != -1 {
+		best := candidates[bestSubkey]
+		copy(candidates[1:bestSubkey+1], candidates[:bestSubkey])
+		candidates[0] = best
 	}
 
 	// If we don't have any subkeys for signing and the primary key
 	// is marked as OK to sign with, then we can use it.
 	if (flags&packet.KeyFlagCertify == 0 || isValidCertificationKey(primarySelfSignature, e.PrimaryKey.PubKeyAlgo, config)) &&
 		(flags&packet.KeyFlagSign == 0 || isValidSigningKey(primarySelfSignature, e.PrimaryKey.PubKeyAlgo, config)) &&
-		(id == 0 || e.PrimaryKey.KeyId == id) {
-		return Key{
+		(id == 0 || e.PrimaryKey.KeyId == id) &&
+		fingerprintMatches(e.PrimaryKey.Fingerprint, fingerprint) {
+		candidates = append(candidates, Key{
 			Entity:               e,
 			PrimarySelfSignature: primarySelfSignature,
 			PublicKey:            e.PrimaryKey,
 			PrivateKey:           e.PrivateKey,
 			SelfSignature:        primarySelfSignature,
-		}, nil
+		})
+	}
+
+	if len(candidates) > 0 {
+		return candidates, nil
 	}
 
 	// No keys with a valid Signing Flag or no keys matched the id passed in
-	return Key{}, errors.StructuralError("no valid signing or verifying key found")
+	return nil, errors.StructuralError("no valid signing or verifying key found")
 }
 
 // Revoked returns whether the entity has any direct key revocation signatures.
