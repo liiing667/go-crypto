@@ -5,6 +5,7 @@
 package openpgp
 
 import (
+	"bytes"
 	goerrors "errors"
 	"fmt"
 	"io"
@@ -266,6 +267,8 @@ func (e *Entity) Revoked(now time.Time) bool {
 // EncryptPrivateKeys encrypts all non-encrypted keys in the entity with the same key
 // derived from the provided passphrase. Public keys and dummy keys are ignored,
 // and don't cause an error to be returned.
+// The encryption is transactional: if any key fails to encrypt, all keys are
+// rolled back, so the entity is never left half-encrypted.
 func (e *Entity) EncryptPrivateKeys(passphrase []byte, config *packet.Config) error {
 	var keysToEncrypt []*packet.PrivateKey
 	// Add entity private key to encrypt.
@@ -285,6 +288,8 @@ func (e *Entity) EncryptPrivateKeys(passphrase []byte, config *packet.Config) er
 // DecryptPrivateKeys decrypts all encrypted keys in the entity with the given passphrase.
 // Avoids recomputation of similar s2k key derivations. Public keys and dummy keys are ignored,
 // and don't cause an error to be returned.
+// The decryption is transactional: if any key fails to decrypt, all keys are
+// rolled back, so the entity is never left half-decrypted.
 func (e *Entity) DecryptPrivateKeys(passphrase []byte) error {
 	var keysToDecrypt []*packet.PrivateKey
 	// Add entity private key to decrypt.
@@ -681,6 +686,9 @@ func addSubkey(e *Entity, packets *packet.Reader, pub *packet.PublicKey, priv *p
 // SerializePrivate serializes an Entity, including private key material, but
 // excluding signatures from other entities, to the given Writer.
 // Identities and subkeys are re-signed in case they changed since NewEntry.
+// The re-signing and serialization are transactional: if any step fails, the
+// self-signatures of the entity are rolled back and nothing is written, so
+// the entity is never left with a mix of old and new self-signatures.
 // If config is nil, sensible defaults will be used.
 func (e *Entity) SerializePrivate(w io.Writer, config *packet.Config) (err error) {
 	if e.PrivateKey.Dummy() {
@@ -702,6 +710,35 @@ func (e *Entity) serializePrivate(w io.Writer, config *packet.Config, reSign boo
 	if e.PrivateKey == nil {
 		return goerrors.New("openpgp: private key is missing")
 	}
+	// Snapshot the self-signatures that re-signing is about to mutate, so
+	// that the migration can be rolled back atomically if any step fails:
+	// a failed migration must not leave the entity with a mix of old and
+	// new self-signatures.
+	tx := packet.NewKeyTransaction()
+	if reSign {
+		for _, ident := range e.Identities {
+			tx.SnapshotSignatures(ident.SelfSignature)
+		}
+		for i := range e.Subkeys {
+			tx.SnapshotSignatures(e.Subkeys[i].Sig)
+		}
+	}
+	// Serialize into a buffer first, so that a failure partway through the
+	// migration never emits a partially migrated entity to w.
+	buf := bytes.NewBuffer(nil)
+	if err = e.serializePrivateTo(buf, config, reSign); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err = io.Copy(w, buf); err != nil {
+		tx.Rollback()
+		return err
+	}
+	tx.Commit()
+	return nil
+}
+
+func (e *Entity) serializePrivateTo(w io.Writer, config *packet.Config, reSign bool) (err error) {
 	err = e.PrivateKey.Serialize(w)
 	if err != nil {
 		return

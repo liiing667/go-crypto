@@ -691,22 +691,34 @@ func (pk *PrivateKey) Decrypt(passphrase []byte) error {
 
 // DecryptPrivateKeys decrypts all encrypted keys with the given config and passphrase.
 // Avoids recomputation of similar s2k key derivations.
+// The decryption is transactional: if any key fails to decrypt, all keys are
+// rolled back to their previous state, so no key is left decrypted while
+// others are still encrypted.
 func DecryptPrivateKeys(keys []*PrivateKey, passphrase []byte) error {
 	// Create a cache to avoid recomputation of key derviations for the same passphrase.
 	s2kCache := &s2k.Cache{}
+	// Snapshot the keys so that the migration can be rolled back atomically
+	// if any key fails to decrypt.
+	tx := NewKeyTransaction()
+	tx.SnapshotKeys(keys...)
 	for _, key := range keys {
 		if key != nil && !key.Dummy() && key.Encrypted {
 			err := key.decryptWithCache(passphrase, s2kCache)
 			if err != nil {
+				tx.Rollback()
 				return err
 			}
 		}
 	}
+	tx.Commit()
 	return nil
 }
 
 // encrypt encrypts an unencrypted private key.
-func (pk *PrivateKey) encrypt(key []byte, params *s2k.Params, s2kType S2KType, cipherFunction CipherFunction, rand io.Reader) error {
+// The encryption is atomic: the key is only modified once all fallible steps
+// have succeeded, so a failed encryption never leaves the key in a
+// half-encrypted state.
+func (pk *PrivateKey) encrypt(key []byte, params *s2k.Params, s2kType S2KType, cipherFunction CipherFunction, aeadMode AEADMode, rand io.Reader) error {
 	if pk.Dummy() {
 		return errors.ErrDummyPrivateKey("dummy key found")
 	}
@@ -732,22 +744,20 @@ func (pk *PrivateKey) encrypt(key []byte, params *s2k.Params, s2kType S2KType, c
 		return err
 	}
 
-	pk.cipher = cipherFunction
-	pk.s2kParams = params
-	pk.s2k, err = pk.s2kParams.Function()
+	s2k, err := params.Function()
 	if err != nil {
 		return err
 	}
 
 	privateKeyBytes := priv.Bytes()
-	pk.s2kType = s2kType
-	block := pk.cipher.new(key)
+	block := cipherFunction.new(key)
+	var iv, encryptedData []byte
 	switch s2kType {
 	case S2KAEAD:
-		if pk.aead == 0 {
+		if aeadMode == 0 {
 			return errors.StructuralError("aead mode is not set on key")
 		}
-		aead, err := pk.aead.new(block)
+		aead, err := aeadMode.new(block)
 		if err != nil {
 			return err
 		}
@@ -755,20 +765,20 @@ func (pk *PrivateKey) encrypt(key []byte, params *s2k.Params, s2kType S2KType, c
 		if err != nil {
 			return err
 		}
-		pk.iv = make([]byte, aead.NonceSize())
-		_, err = io.ReadFull(rand, pk.iv)
+		iv = make([]byte, aead.NonceSize())
+		_, err = io.ReadFull(rand, iv)
 		if err != nil {
 			return err
 		}
-		// Decrypt the encrypted key material with aead
-		pk.encryptedData = aead.Seal(nil, pk.iv, privateKeyBytes, additionalData)
+		// Encrypt the private key material with aead
+		encryptedData = aead.Seal(nil, iv, privateKeyBytes, additionalData)
 	case S2KSHA1, S2KCHECKSUM:
-		pk.iv = make([]byte, pk.cipher.blockSize())
-		_, err = io.ReadFull(rand, pk.iv)
+		iv = make([]byte, cipherFunction.blockSize())
+		_, err = io.ReadFull(rand, iv)
 		if err != nil {
 			return err
 		}
-		cfb := cipher.NewCFBEncrypter(block, pk.iv)
+		cfb := cipher.NewCFBEncrypter(block, iv)
 		if s2kType == S2KSHA1 {
 			h := sha1.New()
 			h.Write(privateKeyBytes)
@@ -781,15 +791,25 @@ func (pk *PrivateKey) encrypt(key []byte, params *s2k.Params, s2kType S2KType, c
 			}
 			privateKeyBytes = append(privateKeyBytes, []byte{uint8(sum >> 8), uint8(sum)}...)
 		}
-		pk.encryptedData = make([]byte, len(privateKeyBytes))
-		cfb.XORKeyStream(pk.encryptedData, privateKeyBytes)
+		encryptedData = make([]byte, len(privateKeyBytes))
+		cfb.XORKeyStream(encryptedData, privateKeyBytes)
 	default:
 		return errors.InvalidArgumentError("invalid s2k type for encryption")
 	}
 
+	// All fallible steps succeeded: commit the new encryption state.
+	pk.cipher = cipherFunction
+	pk.s2kParams = params
+	pk.s2k = s2k
+	pk.s2kType = s2kType
+	if s2kType == S2KAEAD {
+		pk.aead = aeadMode
+	}
+	pk.iv = iv
+	pk.encryptedData = encryptedData
 	pk.Encrypted = true
 	pk.PrivateKey = nil
-	return err
+	return nil
 }
 
 // EncryptWithConfig encrypts an unencrypted private key using the passphrase and the config.
@@ -806,18 +826,21 @@ func (pk *PrivateKey) EncryptWithConfig(passphrase []byte, config *Config) error
 	}
 	s2k(key, passphrase)
 	s2kType := S2KSHA1
+	var aeadMode AEADMode
 	if config.AEAD() != nil {
 		s2kType = S2KAEAD
-		pk.aead = config.AEAD().Mode()
-		pk.cipher = config.Cipher()
-		key = pk.applyHKDF(key)
+		aeadMode = config.AEAD().Mode()
+		key = applyHKDF(key, pk.PublicKey.IsSubkey, pk.Version, config.Cipher(), aeadMode)
 	}
 	// Encrypt the private key with the derived encryption key.
-	return pk.encrypt(key, params, s2kType, config.Cipher(), config.Random())
+	return pk.encrypt(key, params, s2kType, config.Cipher(), aeadMode, config.Random())
 }
 
 // EncryptPrivateKeys encrypts all unencrypted keys with the given config and passphrase.
 // Only derives one key from the passphrase, which is then used to encrypt each key.
+// The encryption is transactional: if any key fails to encrypt, all keys are
+// rolled back to their previous state, so no key is left encrypted while
+// others are not.
 func EncryptPrivateKeys(keys []*PrivateKey, passphrase []byte, config *Config) error {
 	params, err := s2k.Generate(config.Random(), config.S2K())
 	if err != nil {
@@ -830,23 +853,27 @@ func EncryptPrivateKeys(keys []*PrivateKey, passphrase []byte, config *Config) e
 		return err
 	}
 	s2k(encryptionKey, passphrase)
+	// Snapshot the keys so that the migration can be rolled back atomically
+	// if any key fails to encrypt.
+	tx := NewKeyTransaction()
+	tx.SnapshotKeys(keys...)
 	for _, key := range keys {
 		if key != nil && !key.Dummy() && !key.Encrypted {
 			s2kType := S2KSHA1
+			var aeadMode AEADMode
+			keyBytes := encryptionKey
 			if config.AEAD() != nil {
 				s2kType = S2KAEAD
-				key.aead = config.AEAD().Mode()
-				key.cipher = config.Cipher()
-				derivedKey := key.applyHKDF(encryptionKey)
-				err = key.encrypt(derivedKey, params, s2kType, config.Cipher(), config.Random())
-			} else {
-				err = key.encrypt(encryptionKey, params, s2kType, config.Cipher(), config.Random())
+				aeadMode = config.AEAD().Mode()
+				keyBytes = applyHKDF(encryptionKey, key.PublicKey.IsSubkey, key.Version, config.Cipher(), aeadMode)
 			}
-			if err != nil {
+			if err = key.encrypt(keyBytes, params, s2kType, config.Cipher(), aeadMode, config.Random()); err != nil {
+				tx.Rollback()
 				return err
 			}
 		}
 	}
+	tx.Commit()
 	return nil
 }
 
@@ -1196,18 +1223,25 @@ func (pk *PrivateKey) additionalData() ([]byte, error) {
 	return additionalData.Bytes(), nil
 }
 
-func (pk *PrivateKey) applyHKDF(inputKey []byte) []byte {
+// applyHKDF derives a private key encryption key from the input key, binding
+// it to the key type (primary or subkey), the key version, and the
+// cipher and aead algorithms in use.
+func applyHKDF(inputKey []byte, isSubkey bool, version int, cipherFunc CipherFunction, aeadMode AEADMode) []byte {
 	var packetByte byte
-	if pk.PublicKey.IsSubkey {
+	if isSubkey {
 		packetByte = 0xc7
 	} else {
 		packetByte = 0xc5
 	}
-	associatedData := []byte{packetByte, byte(pk.Version), byte(pk.cipher), byte(pk.aead)}
+	associatedData := []byte{packetByte, byte(version), byte(cipherFunc), byte(aeadMode)}
 	hkdfReader := hkdf.New(sha256.New, inputKey, []byte{}, associatedData)
-	encryptionKey := make([]byte, pk.cipher.KeySize())
+	encryptionKey := make([]byte, cipherFunc.KeySize())
 	_, _ = readFull(hkdfReader, encryptionKey)
 	return encryptionKey
+}
+
+func (pk *PrivateKey) applyHKDF(inputKey []byte) []byte {
+	return applyHKDF(inputKey, pk.PublicKey.IsSubkey, pk.Version, pk.cipher, pk.aead)
 }
 
 // parseMldsaEddsaPrivateKey parses a ML-DSA + EdDSA private key as specified in
